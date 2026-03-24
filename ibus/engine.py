@@ -51,6 +51,13 @@ class VoCoTypeEngine(IBus.Engine):
     _active_sessions = set()
     _session_lock = threading.Lock()
 
+    # 共享ASR服务（跨engine实例复用，避免重复加载模型）
+    _shared_asr_server = None
+    _shared_asr_lock = threading.Lock()
+    _shared_asr_initializing = False
+    _shared_asr_ready = threading.Event()
+    _shared_asr_init_error: Optional[str] = None
+
     def __init__(self, bus: IBus.Bus, object_path: str):
         # 需要显式传入 DBus 连接与 object_path，避免 GLib g_variant object_path 断言失败。
         super().__init__(connection=bus.get_connection(), object_path=object_path)
@@ -64,10 +71,7 @@ class VoCoTypeEngine(IBus.Engine):
         self._capture_thread: Optional[threading.Thread] = None
         self._stream = None
 
-        # ASR服务器（懒加载）
-        self._asr_server = None
-        self._asr_initializing = False
-        self._asr_ready = threading.Event()
+        # ASR服务使用类级共享实例
         self._native_sample_rate = CONFIGURED_SAMPLE_RATE
 
         # Rime 集成（使用 pyrime 直接调用 librime）
@@ -403,37 +407,78 @@ class VoCoTypeEngine(IBus.Engine):
         self.hide_lookup_table()
 
     def _ensure_asr_ready(self):
-        """确保ASR服务器已初始化（懒加载）"""
-        if self._asr_server is not None:
+        """确保共享ASR服务器已初始化（懒加载）"""
+        cls = type(self)
+        if cls._shared_asr_server is not None and cls._shared_asr_ready.is_set():
             return True
 
-        if self._asr_initializing:
-            # 等待初始化完成
-            return self._asr_ready.wait(timeout=60)
+        with cls._shared_asr_lock:
+            if cls._shared_asr_server is not None and cls._shared_asr_ready.is_set():
+                return True
+            if cls._shared_asr_initializing:
+                return False
+            cls._shared_asr_initializing = True
+            cls._shared_asr_init_error = None
+            cls._shared_asr_ready.clear()
 
-        self._asr_initializing = True
-
-        def init_asr():
+        def init_asr_shared():
+            server = None
             try:
-                logger.info("开始初始化FunASR...")
+                logger.info("开始初始化FunASR（共享实例）...")
                 from app.funasr_server import FunASRServer
-                self._asr_server = FunASRServer()
-                result = self._asr_server.initialize()
+                server = FunASRServer()
+                result = server.initialize()
                 if result["success"]:
-                    logger.info("FunASR初始化成功")
-                    self._asr_ready.set()
+                    with cls._shared_asr_lock:
+                        cls._shared_asr_server = server
+                        cls._shared_asr_ready.set()
+                    logger.info("FunASR共享实例初始化成功")
                 else:
-                    logger.error(f"FunASR初始化失败: {result.get('error')}")
-                    self._asr_server = None
+                    error_msg = str(result.get("error", "未知错误"))
+                    logger.error("FunASR共享实例初始化失败: %s", error_msg)
+                    with cls._shared_asr_lock:
+                        cls._shared_asr_server = None
+                        cls._shared_asr_init_error = error_msg
+                        cls._shared_asr_ready.clear()
+                    try:
+                        if server is not None:
+                            server.cleanup()
+                    except Exception:
+                        pass
             except Exception as e:
-                logger.error(f"FunASR初始化异常: {e}")
-                self._asr_server = None
+                logger.error("FunASR共享实例初始化异常: %s", e)
+                with cls._shared_asr_lock:
+                    cls._shared_asr_server = None
+                    cls._shared_asr_init_error = str(e)
+                    cls._shared_asr_ready.clear()
+                try:
+                    if server is not None:
+                        server.cleanup()
+                except Exception:
+                    pass
             finally:
-                self._asr_initializing = False
+                with cls._shared_asr_lock:
+                    cls._shared_asr_initializing = False
 
         # 后台初始化
-        threading.Thread(target=init_asr, daemon=True).start()
+        threading.Thread(target=init_asr_shared, daemon=True).start()
         return False
+
+    @classmethod
+    def shutdown_shared_asr(cls):
+        """在进程退出时主动释放共享ASR资源"""
+        with cls._shared_asr_lock:
+            server = cls._shared_asr_server
+            cls._shared_asr_server = None
+            cls._shared_asr_initializing = False
+            cls._shared_asr_init_error = None
+            cls._shared_asr_ready.clear()
+        if server is not None:
+            try:
+                server.cleanup()
+                logger.info("FunASR共享实例已释放")
+            except Exception as exc:
+                logger.warning("释放FunASR共享实例失败: %s", exc)
 
     def do_process_key_event(self, keyval, keycode, state):
         """处理按键事件"""
@@ -729,13 +774,22 @@ class VoCoTypeEngine(IBus.Engine):
                     write_wav(Path(temp_path), audio_16k.tobytes(), SAMPLE_RATE)
 
                 try:
-                    # 等待ASR就绪
-                    if not self._asr_ready.wait(timeout=30):
-                        GLib.idle_add(self._show_error, "ASR未就绪")
+                    # 等待共享ASR就绪
+                    cls = type(self)
+                    if not cls._shared_asr_ready.wait(timeout=30):
+                        with cls._shared_asr_lock:
+                            err = cls._shared_asr_init_error or "ASR未就绪"
+                        GLib.idle_add(self._show_error, err)
+                        return
+
+                    with cls._shared_asr_lock:
+                        asr_server = cls._shared_asr_server
+                    if asr_server is None:
+                        GLib.idle_add(self._show_error, "ASR实例不可用")
                         return
 
                     # 转录
-                    result = self._asr_server.transcribe_audio(temp_path)
+                    result = asr_server.transcribe_audio(temp_path)
 
                     if result.get("success"):
                         text = result.get("text", "").strip()

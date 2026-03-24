@@ -91,6 +91,7 @@ gi.require_version('IBus', '1.0')
 from gi.repository import IBus, GLib
 
 from ibus.factory import VoCoTypeFactory
+from ibus.engine import VoCoTypeEngine
 from vocotype_version import __version__
 
 logger = logging.getLogger(__name__)
@@ -225,6 +226,8 @@ def main():
         app.run()
     except KeyboardInterrupt:
         app.quit()
+    finally:
+        VoCoTypeEngine.shutdown_shared_asr()
 
 
 if __name__ == "__main__":
