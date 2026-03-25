@@ -542,7 +542,8 @@ After=graphical-session.target
 [Service]
 Type=simple
 ExecStart=$HOME/.local/bin/vocotype-fcitx5-backend
-Restart=on-failure
+# 改进重启策略：任何情况下都重启（包括休眠后被终止）
+Restart=always
 RestartSec=5s
 Environment="PYTHONIOENCODING=UTF-8"
 
