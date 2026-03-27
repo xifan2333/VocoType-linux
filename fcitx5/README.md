@@ -58,7 +58,7 @@ bash fcitx5/scripts/install-fcitx5.sh
 1. 检查 Fcitx 5 和编译依赖
 2. 编译 C++ Addon
 3. 安装 Python 后端
-4. 配置 Python 虚拟环境
+4. 配置 Python 虚拟环境（支持手动指定 conda 解释器）
 5. 配置音频设备（可选）
 6. 创建 systemd 服务
 

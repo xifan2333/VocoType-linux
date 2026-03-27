@@ -43,6 +43,78 @@ done
 PROJECT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
 INSTALL_DIR="$HOME/.local/share/vocotype-fcitx5"
 SCRIPT_DIR="$PROJECT_DIR/scripts"
+PYTHON_MIN_MINOR=11
+PYTHON_MAX_MINOR=12
+DEFAULT_UV_PYTHON="3.12"
+
+resolve_python_cmd() {
+    local py="$1"
+
+    if [[ "$py" == "~/"* ]]; then
+        py="$HOME/${py#~/}"
+    fi
+
+    if [[ "$py" == */* ]]; then
+        [ -x "$py" ] || return 1
+        echo "$py"
+        return 0
+    fi
+
+    command -v "$py" 2>/dev/null || return 1
+}
+
+get_python_version() {
+    "$1" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null
+}
+
+is_supported_python() {
+    local py="$1"
+    local py_version
+    local major
+    local minor
+
+    py_version=$(get_python_version "$py") || return 1
+    major=$(echo "$py_version" | cut -d. -f1)
+    minor=$(echo "$py_version" | cut -d. -f2)
+    [ "$major" -eq 3 ] && [ "$minor" -ge "$PYTHON_MIN_MINOR" ] && [ "$minor" -le "$PYTHON_MAX_MINOR" ]
+}
+
+detect_system_python() {
+    local py
+    local resolved_py
+
+    for py in python3.12 python3.11 python3; do
+        if resolved_py=$(resolve_python_cmd "$py"); then
+            if is_supported_python "$resolved_py"; then
+                echo "$resolved_py"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+print_python_help() {
+    echo ""
+    echo "原因: VoCoType 使用 onnxruntime 运行语音识别模型，"
+    echo "      而 onnxruntime 官方尚未支持 Python 3.13+。"
+    echo "      参考: https://github.com/microsoft/onnxruntime/issues/21292"
+    echo ""
+    echo "解决方案："
+    echo ""
+    echo "  【推荐】安装 uv（自动管理 Python 版本和虚拟环境）："
+    echo "    curl -LsSf https://astral.sh/uv/install.sh | sh"
+    echo "    然后重新打开终端，再运行本脚本"
+    echo ""
+    echo "  或手动安装 Python 3.12："
+    echo "    Fedora: sudo dnf install python3.12"
+    echo "    Ubuntu: sudo apt install python3.12"
+    echo "    Arch:   sudo pacman -S python312"
+    echo ""
+    echo "  或使用 conda 创建兼容环境（安装脚本可手动指定解释器）："
+    echo "    conda create -n vocotype python=3.12"
+    echo "    conda activate vocotype"
+}
 
 echo "=== VoCoType Fcitx 5 语音输入法安装 ==="
 echo "项目目录: $PROJECT_DIR"
@@ -213,43 +285,50 @@ echo "✓ Python 后端已安装"
 echo ""
 echo "[7/9] 配置 Python 环境..."
 
+echo "请选择 Python 解释器来源："
+echo "  [1] 自动检测（推荐，优先 uv）"
+echo "  [2] 手动指定 Python 解释器（如 conda 环境）"
+read -r -p "请输入选项 (默认 1): " PYTHON_SOURCE_CHOICE
+
+CUSTOM_PYTHON_CMD=""
+if [ "$PYTHON_SOURCE_CHOICE" = "2" ]; then
+    read -r -e -p "请输入 Python 解释器路径或命令名: " CUSTOM_PYTHON_INPUT
+    if [ -z "$CUSTOM_PYTHON_INPUT" ]; then
+        echo "错误: 未输入 Python 解释器"
+        exit 1
+    fi
+
+    CUSTOM_PYTHON_CMD=$(resolve_python_cmd "$CUSTOM_PYTHON_INPUT") || {
+        echo "错误: 未找到 Python 解释器: $CUSTOM_PYTHON_INPUT"
+        exit 1
+    }
+
+    if ! is_supported_python "$CUSTOM_PYTHON_CMD"; then
+        custom_py_version=$(get_python_version "$CUSTOM_PYTHON_CMD")
+        echo "错误: 解释器版本不兼容（当前 ${custom_py_version:-unknown}，需要 Python 3.11-3.12）"
+        print_python_help
+        exit 1
+    fi
+fi
+
 # 检测可用的 Python 版本（需要 3.11-3.12，onnxruntime 不支持 3.13+）
 PYTHON_CMD=""
-if command -v uv &>/dev/null; then
-    PYTHON_CMD="3.12"
+if [ -n "$CUSTOM_PYTHON_CMD" ]; then
+    PYTHON_CMD="$CUSTOM_PYTHON_CMD"
+    echo "使用手动指定的 Python: $PYTHON_CMD ($(get_python_version "$PYTHON_CMD"))"
+elif command -v uv &>/dev/null; then
+    PYTHON_CMD="$DEFAULT_UV_PYTHON"
     echo "检测到 uv，使用 uv 管理 Python: $PYTHON_CMD"
 else
-    for py in python3.12 python3.11 python3; do
-        if command -v "$py" &>/dev/null; then
-            py_version=$("$py" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-            major=$(echo "$py_version" | cut -d. -f1)
-            minor=$(echo "$py_version" | cut -d. -f2)
-            if [ "$major" -eq 3 ] && [ "$minor" -ge 11 ] && [ "$minor" -le 12 ]; then
-                PYTHON_CMD="$py"
-                echo "使用 Python $py_version"
-                break
-            fi
-        fi
-    done
+    PYTHON_CMD=$(detect_system_python) || true
+    if [ -n "$PYTHON_CMD" ]; then
+        echo "检测到兼容的 Python: $PYTHON_CMD ($(get_python_version "$PYTHON_CMD"))"
+    fi
 fi
 
 if [ -z "$PYTHON_CMD" ]; then
     echo "错误: 需要 Python 3.11-3.12"
-    echo ""
-    echo "原因: VoCoType 使用 onnxruntime 运行语音识别模型，"
-    echo "      而 onnxruntime 官方尚未支持 Python 3.13+。"
-    echo "      参考: https://github.com/microsoft/onnxruntime/issues/21292"
-    echo ""
-    echo "解决方案："
-    echo ""
-    echo "  【推荐】安装 uv（自动管理 Python 版本和虚拟环境）："
-    echo "    curl -LsSf https://astral.sh/uv/install.sh | sh"
-    echo "    然后重新打开终端，再运行本脚本"
-    echo ""
-    echo "  或手动安装 Python 3.12："
-    echo "    Fedora: sudo dnf install python3.12"
-    echo "    Ubuntu: sudo apt install python3.12"
-    echo "    Arch:   sudo pacman -S python312"
+    print_python_help
     exit 1
 fi
 

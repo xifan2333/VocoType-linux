@@ -47,6 +47,7 @@ ibus restart
 - 项目虚拟环境（推荐）
 - 用户级虚拟环境 (`~/.local/share/vocotype/.venv`)
 - 系统 Python（省空间，需自行安装依赖）
+- 手动指定 Python 解释器（例如 conda 环境的 `python`）
 
 > **模型下载**：首次运行时，程序会自动下载约 500MB 的模型文件。
 

@@ -36,15 +36,48 @@ PYTHON_MIN_MINOR=11
 PYTHON_MAX_MINOR=12
 DEFAULT_UV_PYTHON="3.12"
 
+resolve_python_cmd() {
+    local py="$1"
+
+    if [[ "$py" == "~/"* ]]; then
+        py="$HOME/${py#~/}"
+    fi
+
+    if [[ "$py" == */* ]]; then
+        [ -x "$py" ] || return 1
+        echo "$py"
+        return 0
+    fi
+
+    command -v "$py" 2>/dev/null || return 1
+}
+
+get_python_version() {
+    "$1" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null
+}
+
+is_supported_python() {
+    local py="$1"
+    local py_version
+    local major
+    local minor
+
+    py_version=$(get_python_version "$py") || return 1
+    major=$(echo "$py_version" | cut -d. -f1)
+    minor=$(echo "$py_version" | cut -d. -f2)
+
+    [ "$major" -eq 3 ] && [ "$minor" -ge "$PYTHON_MIN_MINOR" ] && [ "$minor" -le "$PYTHON_MAX_MINOR" ]
+}
+
 # 检测系统可用的 Python 版本（需要 3.11-3.12）
 detect_system_python() {
+    local py
+    local resolved_py
+
     for py in python3.12 python3.11 python3; do
-        if command -v "$py" &>/dev/null; then
-            py_version=$("$py" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-            major=$(echo "$py_version" | cut -d. -f1)
-            minor=$(echo "$py_version" | cut -d. -f2)
-            if [ "$major" -eq 3 ] && [ "$minor" -ge "$PYTHON_MIN_MINOR" ] && [ "$minor" -le "$PYTHON_MAX_MINOR" ]; then
-                echo "$py"
+        if resolved_py=$(resolve_python_cmd "$py"); then
+            if is_supported_python "$resolved_py"; then
+                echo "$resolved_py"
                 return 0
             fi
         fi
@@ -69,6 +102,10 @@ print_python_help() {
     echo "    Ubuntu 22.04: sudo apt install python3.12 python3.12-venv"
     echo "    Debian 13:    官方源无 3.12，建议使用 uv"
     echo "    Arch:         sudo pacman -S python312"
+    echo ""
+    echo "  或使用 conda 创建兼容环境（安装脚本可手动指定解释器）："
+    echo "    conda create -n vocotype python=3.12"
+    echo "    conda activate vocotype"
 }
 
 # 检测 IBus 引擎必需的系统构建依赖（用于编译 pycairo/pygobject）
@@ -212,15 +249,38 @@ echo "请选择 Python 环境："
 echo "  [1] 使用项目虚拟环境（推荐）: $PROJECT_DIR/.venv"
 echo "  [2] 使用用户级虚拟环境: $INSTALL_DIR/.venv"
 echo "  [3] 使用系统 Python（省空间，需自行安装依赖）"
+echo "  [4] 手动指定 Python 解释器（如 conda 环境）"
 read -r -p "请输入选项 (默认 1): " PY_CHOICE
 
 USE_SYSTEM_PYTHON=0
+CUSTOM_PYTHON_CMD=""
 case "$PY_CHOICE" in
     2)
         PYTHON="$INSTALL_DIR/.venv/bin/python"
         ;;
     3)
         USE_SYSTEM_PYTHON=1
+        ;;
+    4)
+        read -r -e -p "请输入 Python 解释器路径或命令名: " CUSTOM_PYTHON_INPUT
+        if [ -z "$CUSTOM_PYTHON_INPUT" ]; then
+            echo "错误: 未输入 Python 解释器"
+            exit 1
+        fi
+
+        CUSTOM_PYTHON_CMD=$(resolve_python_cmd "$CUSTOM_PYTHON_INPUT") || {
+            echo "错误: 未找到 Python 解释器: $CUSTOM_PYTHON_INPUT"
+            exit 1
+        }
+
+        if ! is_supported_python "$CUSTOM_PYTHON_CMD"; then
+            custom_py_version=$(get_python_version "$CUSTOM_PYTHON_CMD")
+            echo "错误: 解释器版本不兼容（当前 ${custom_py_version:-unknown}，需要 Python 3.11-3.12）"
+            print_python_help
+            exit 1
+        fi
+
+        PYTHON="$PROJECT_DIR/.venv/bin/python"
         ;;
     ""|1|*)
         PYTHON="$PROJECT_DIR/.venv/bin/python"
@@ -236,7 +296,10 @@ if [ "$USE_SYSTEM_PYTHON" = "1" ]; then
     PYTHON="$PYTHON_CMD"
     echo "使用系统 Python: $PYTHON_CMD"
 else
-    if command -v uv >/dev/null 2>&1; then
+    if [ -n "$CUSTOM_PYTHON_CMD" ]; then
+        PYTHON_CMD="$CUSTOM_PYTHON_CMD"
+        echo "使用手动指定的 Python: $PYTHON_CMD ($(get_python_version "$PYTHON_CMD"))"
+    elif command -v uv >/dev/null 2>&1; then
         PYTHON_CMD="$DEFAULT_UV_PYTHON"
         echo "检测到 uv，使用 uv 管理 Python: $PYTHON_CMD"
     else
