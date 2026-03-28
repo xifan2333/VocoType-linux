@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """VoCoType IBus Engine - PTT语音输入法引擎
 
-按住F9说话，松开后识别并输入到光标处。
+按住F9说话，松开后识别并输入到光标处（极速模式）。
+按住Shift+F9可启用长句模式，支持可选 SLM 润色。
 其他按键转发给 Rime 处理。
 """
 
@@ -28,6 +29,8 @@ from app.audio_utils import (
     load_audio_config,
     resample_audio,
 )
+from app.config import DEFAULT_CONFIG, load_config
+from app.slm_polisher import SLMPolisher
 
 if TYPE_CHECKING:
     from pyrime.session import Session as RimeSession
@@ -36,8 +39,23 @@ logger = logging.getLogger(__name__)
 
 # 音频参数
 BLOCK_MS = 20
+DEFAULT_IBUS_CONFIG_PATH = "~/.config/vocotype/ibus.json"
 
 AUDIO_DEVICE, CONFIGURED_SAMPLE_RATE = load_audio_config()
+
+
+def load_ibus_config() -> dict:
+    """Load IBus runtime config with safe fallback."""
+    config_path = os.environ.get("VOCOTYPE_IBUS_CONFIG", DEFAULT_IBUS_CONFIG_PATH)
+    expanded_path = os.path.expanduser(config_path)
+    if not os.path.exists(expanded_path):
+        return dict(DEFAULT_CONFIG)
+
+    try:
+        return load_config(expanded_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("加载 IBus 配置失败(%s): %s，回退默认配置", expanded_path, exc)
+        return dict(DEFAULT_CONFIG)
 
 class VoCoTypeEngine(IBus.Engine):
     """VoCoType IBus语音输入引擎"""
@@ -46,6 +64,9 @@ class VoCoTypeEngine(IBus.Engine):
 
     # PTT触发键
     PTT_KEYVAL = IBus.KEY_F9
+    # Linux evdev keycode for physical F9. This keeps PTT working even when
+    # desktop firmware maps top-row F keys to media keyvals under Fn-lock.
+    PTT_FALLBACK_KEYCODE = 67
 
     # 全局session跟踪（用于调试）
     _active_sessions = set()
@@ -65,11 +86,17 @@ class VoCoTypeEngine(IBus.Engine):
 
         # 状态
         self._is_recording = False
+        self._recording_long_mode = False
         self._audio_frames: list[np.ndarray] = []
         self._audio_queue: queue.Queue = queue.Queue(maxsize=500)
         self._stop_event = threading.Event()
         self._capture_thread: Optional[threading.Thread] = None
         self._stream = None
+
+        # 运行配置（用于长句模式）
+        self._runtime_config = load_ibus_config()
+        self._slm_polisher = SLMPolisher(self._runtime_config.get("slm", {}))
+        logger.info("IBus SLM 长句润色: enabled=%s", self._slm_polisher.enabled)
 
         # ASR服务使用类级共享实例
         self._native_sample_rate = CONFIGURED_SAMPLE_RATE
@@ -509,16 +536,18 @@ class VoCoTypeEngine(IBus.Engine):
         # 检查是否是松开事件
         is_release = bool(state & IBus.ModifierType.RELEASE_MASK)
 
-        # 只处理F9键
-        if keyval != self.PTT_KEYVAL:
+        # 处理 F9 键：优先 keyval，其次兼容物理 keycode（Fn 锁/多媒体键场景）
+        is_ptt_key = (keyval == self.PTT_KEYVAL) or (keycode == self.PTT_FALLBACK_KEYCODE)
+        if not is_ptt_key:
             if self._is_ibus_switch_hotkey(keyval, state):
                 return False
             return self._forward_key_to_rime(keyval, keycode, state)
 
         if not is_release:
             # F9按下 -> 开始录音
+            long_mode = bool(state & IBus.ModifierType.SHIFT_MASK)
             if not self._is_recording:
-                self._start_recording()
+                self._start_recording(long_mode=long_mode)
             return True
         else:
             # F9松开 -> 停止录音并转录
@@ -648,7 +677,7 @@ class VoCoTypeEngine(IBus.Engine):
             return True
         return False
 
-    def _start_recording(self):
+    def _start_recording(self, long_mode: bool = False):
         """开始录音"""
         if self._is_recording:
             return
@@ -657,6 +686,7 @@ class VoCoTypeEngine(IBus.Engine):
             import sounddevice as sd
 
             self._is_recording = True
+            self._recording_long_mode = long_mode
             self._audio_frames.clear()
             self._stop_event.clear()
 
@@ -704,8 +734,13 @@ class VoCoTypeEngine(IBus.Engine):
             self._capture_thread.start()
 
             # 显示录音状态
-            self._update_preedit("🎤 录音中...")
-            logger.info("开始录音")
+            if long_mode:
+                self._update_preedit("🎤 录音中(长句)...")
+                # 录音期间并行预加载本地一次性 SLM，减少松键后的等待时间
+                self._slm_polisher.prewarm(long_mode=True)
+            else:
+                self._update_preedit("🎤 录音中...")
+            logger.info("开始录音 mode=%s", "long" if long_mode else "normal")
 
             # 确保ASR已初始化
             self._ensure_asr_ready()
@@ -713,6 +748,7 @@ class VoCoTypeEngine(IBus.Engine):
         except Exception as e:
             logger.error(f"启动录音失败: {e}")
             self._is_recording = False
+            self._recording_long_mode = False
             self._update_preedit(f"❌ 录音失败: {e}")
             GLib.timeout_add(2000, self._clear_preedit)
 
@@ -721,6 +757,7 @@ class VoCoTypeEngine(IBus.Engine):
         if not self._is_recording:
             return
 
+        long_mode = self._recording_long_mode
         self._stop_event.set()
 
         if self._stream:
@@ -736,13 +773,18 @@ class VoCoTypeEngine(IBus.Engine):
             self._capture_thread = None
 
         self._is_recording = False
+        self._recording_long_mode = False
         self._clear_preedit()
+        if long_mode:
+            self._slm_polisher.release()
         logger.info("录音已停止")
 
     def _stop_and_transcribe(self):
         """停止录音并转录"""
         if not self._is_recording:
             return
+
+        long_mode = self._recording_long_mode
 
         # 停止录音
         self._stop_event.set()
@@ -760,10 +802,13 @@ class VoCoTypeEngine(IBus.Engine):
             self._capture_thread = None
 
         self._is_recording = False
+        self._recording_long_mode = False
 
         # 检查是否有音频数据
         if not self._audio_frames:
             self._clear_preedit()
+            if long_mode:
+                self._slm_polisher.release()
             return
 
         # 合并音频
@@ -771,15 +816,20 @@ class VoCoTypeEngine(IBus.Engine):
         self._audio_frames.clear()
 
         duration = len(audio_data) / self._native_sample_rate
-        logger.info(f"录音完成，时长: {duration:.2f}秒")
+        logger.info("录音完成，时长: %.2f秒, mode=%s", duration, "long" if long_mode else "normal")
 
         # 检查是否太短
         if duration < 0.3:
             self._clear_preedit()
+            if long_mode:
+                self._slm_polisher.release()
             return
 
         # 显示识别中状态
-        self._update_preedit("⏳ 识别中...")
+        if long_mode:
+            self._update_preedit("⏳ 识别+润色中...")
+        else:
+            self._update_preedit("⏳ 识别中...")
 
         # 在后台线程中转录
         def do_transcribe():
@@ -809,13 +859,78 @@ class VoCoTypeEngine(IBus.Engine):
                         return
 
                     # 转录
-                    result = asr_server.transcribe_audio(temp_path)
+                    asr_start = time.perf_counter()
+                    result = asr_server.transcribe_audio(
+                        temp_path,
+                        options=self._runtime_config.get("asr"),
+                    )
+                    asr_ms = (time.perf_counter() - asr_start) * 1000.0
 
                     if result.get("success"):
                         text = result.get("text", "").strip()
                         if text:
-                            GLib.idle_add(self._commit_text, text)
+                            final_text = text
+                            slm_ms = 0.0
+                            slm_reason = "not_used"
+                            slm_used = False
+
+                            if long_mode:
+                                should_polish = self._slm_polisher.should_polish(
+                                    text,
+                                    long_mode=True,
+                                )
+                                if should_polish:
+                                    GLib.idle_add(self._update_preedit, "✨ 润色中...")
+                                    polished_text, metrics = self._slm_polisher.polish(
+                                        text,
+                                        long_mode=True,
+                                    )
+                                    slm_ms = metrics.latency_ms
+                                    slm_reason = metrics.reason
+                                    slm_used = metrics.used
+                                    if self._slm_polisher.is_failure_reason(metrics.reason):
+                                        logger.warning(
+                                            "长句 SLM 调用失败: reason=%s",
+                                            metrics.reason,
+                                        )
+                                        logger.info(
+                                            "转录流水线 mode=%s asr_ms=%.2f slm_used=%s slm_ms=%.2f fallback_reason=%s",
+                                            "long",
+                                            asr_ms,
+                                            slm_used,
+                                            slm_ms,
+                                            slm_reason,
+                                        )
+                                        GLib.idle_add(
+                                            self._show_error,
+                                            self._slm_polisher.format_failure_message(
+                                                metrics.reason
+                                            ),
+                                        )
+                                        return
+                                    final_text = polished_text
+                                else:
+                                    slm_reason = (
+                                        "disabled"
+                                        if not self._slm_polisher.enabled
+                                        else "too_short"
+                                    )
+
+                            logger.info(
+                                "转录流水线 mode=%s asr_ms=%.2f slm_used=%s slm_ms=%.2f fallback_reason=%s",
+                                "long" if long_mode else "normal",
+                                asr_ms,
+                                slm_used,
+                                slm_ms,
+                                slm_reason,
+                            )
+                            GLib.idle_add(self._commit_text, final_text)
                         else:
+                            logger.info(
+                                "转录流水线 mode=%s asr_ms=%.2f slm_used=false slm_ms=0.00 fallback_reason=empty_asr_text",
+                                "long" if long_mode else "normal",
+                                asr_ms,
+                            )
                             GLib.idle_add(self._clear_preedit)
                     else:
                         error = result.get("error", "未知错误")
@@ -826,6 +941,8 @@ class VoCoTypeEngine(IBus.Engine):
                         os.unlink(temp_path)
                     except:
                         pass
+                    if long_mode:
+                        self._slm_polisher.release()
 
             except Exception as e:
                 logger.error(f"转录失败: {e}")

@@ -295,7 +295,10 @@ class FunASRServer:
                     importlib.import_module(m)
                 logger.info("funasr_onnx 模块预导入完成")
             except Exception as pre_e:
-                logger.warning("funasr_onnx 预导入失败: %s", str(pre_e))
+                logger.info(
+                    "funasr_onnx 预导入部分模块失败（通常不影响 ONNX 推理）: %s",
+                    str(pre_e),
+                )
 
             # 创建加载结果存储
             results = {}

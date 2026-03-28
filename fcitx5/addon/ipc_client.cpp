@@ -79,14 +79,15 @@ std::string IPCClient::sendRequest(const std::string& request) {
     return response;
 }
 
-TranscribeResult IPCClient::transcribeAudio(const std::string& audio_path) {
+TranscribeResult IPCClient::transcribeAudio(const std::string& audio_path, bool long_mode) {
     TranscribeResult result;
 
     try {
         // 构建请求
         json request = {
             {"type", "transcribe"},
-            {"audio_path", audio_path}
+            {"audio_path", audio_path},
+            {"long_mode", long_mode}
         };
 
         // 发送请求
@@ -108,6 +109,28 @@ TranscribeResult IPCClient::transcribeAudio(const std::string& audio_path) {
     }
 
     return result;
+}
+
+bool IPCClient::prewarmSlm() {
+    try {
+        json request = {{"type", "slm_prewarm"}};
+        std::string response_str = sendRequest(request.dump());
+        json response = json::parse(response_str);
+        return response.value("success", false);
+    } catch (const std::exception& e) {
+        return false;
+    }
+}
+
+bool IPCClient::releaseSlm() {
+    try {
+        json request = {{"type", "slm_release"}};
+        std::string response_str = sendRequest(request.dump());
+        json response = json::parse(response_str);
+        return response.value("success", false);
+    } catch (const std::exception& e) {
+        return false;
+    }
 }
 
 RimeUIState IPCClient::processKey(int keyval, int mask) {

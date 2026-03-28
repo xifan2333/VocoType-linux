@@ -11,11 +11,14 @@ funasr_onnx==0.4.1
 jieba==0.42.1
 
 # IBus Python 绑定 (Linux 必需)
-PyGObject==3.42.0
+# PyGObject 3.42 在 Python 3.12 上会导致 gi.repository 动态导入失效
+#（F9 无响应，engine 进程启动即退出），因此按 Python 版本分流。
+PyGObject>=3.42.0; python_version < "3.12"
+PyGObject>=3.56.0; python_version >= "3.12"
 
 # 模型下载 (推荐)
 modelscope==1.30.0
 
 # 说明：
-# - 使用 ONNX 路线（onnxruntime）；如需 GPU/PyTorch，请安装 torch(+cu) 与 torchaudio
+# - 默认使用 ONNX 路线；启用本地 SLM 需要 torch（CPU/GPU 版本按需选择）
 # - PyGObject 需要系统包：python3-gi, gir1.2-ibus-1.0, gobject-introspection

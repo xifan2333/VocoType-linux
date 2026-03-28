@@ -64,7 +64,21 @@ public:
      * @param audio_path 音频文件路径
      * @return 识别结果
      */
-    TranscribeResult transcribeAudio(const std::string& audio_path);
+    TranscribeResult transcribeAudio(const std::string& audio_path, bool long_mode = false);
+
+    /**
+     * 预加载 SLM（长句模式按下时调用）
+     *
+     * @return 是否请求成功
+     */
+    bool prewarmSlm();
+
+    /**
+     * 释放 SLM 资源（长句流程结束后调用）
+     *
+     * @return 是否请求成功
+     */
+    bool releaseSlm();
 
     /**
      * 处理 Rime 按键

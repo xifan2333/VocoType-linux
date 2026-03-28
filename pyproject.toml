@@ -18,9 +18,9 @@ dependencies = [
   "soundfile==0.13.1",
   "funasr_onnx==0.4.1",
   "jieba==0.42.1",
-  "PyGObject==3.42.0",
+  "PyGObject>=3.42.0; python_version < '3.12'",
+  "PyGObject>=3.56.0; python_version >= '3.12'",
   "modelscope==1.30.0",
-  "torch>=2.9.1",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +31,12 @@ rime = [
 # 完整功能（语音 + 拼音）
 full = [
   "pyrime>=0.2.1",
+]
+slm = [
+  "torch>=2.9.1",
+  "transformers>=5.4.0",
+  "sentencepiece>=0.2.1",
+  "socksio>=1.0.0",
 ]
 
 [project.urls]

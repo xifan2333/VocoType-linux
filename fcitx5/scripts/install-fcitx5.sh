@@ -47,6 +47,21 @@ PYTHON_MIN_MINOR=11
 PYTHON_MAX_MINOR=12
 DEFAULT_UV_PYTHON="3.12"
 
+# SLM 可选配置（默认关闭）
+ENABLE_SLM=0
+SLM_PROVIDER="local_ephemeral"
+SLM_ENDPOINT="http://127.0.0.1:18080/v1/chat/completions"
+SLM_MODEL="Qwen/Qwen3.5-0.8B"
+SLM_LOCAL_MODEL="$SLM_MODEL"
+SLM_LOCAL_PYTHON=""
+SLM_TIMEOUT_MS=600
+SLM_WARMUP_TIMEOUT_MS=12000
+SLM_MIN_CHARS=8
+SLM_MAX_TOKENS=24
+SLM_ENABLE_THINKING=0
+SLM_API_KEY=""
+SLM_INSTALL_LOCAL_DEPS=0
+
 resolve_python_cmd() {
     local py="$1"
 
@@ -116,8 +131,144 @@ print_python_help() {
     echo "    conda activate vocotype"
 }
 
+write_slm_config_json() {
+    local config_file="$1"
+    local python_bin="$2"
+    local enabled="$3"
+    local provider="$4"
+    local endpoint="$5"
+    local model="$6"
+    local local_model="$7"
+    local local_python="$8"
+    local timeout_ms="$9"
+    local min_chars="${10}"
+    local max_tokens="${11}"
+    local warmup_timeout_ms="${12}"
+    local enable_thinking="${13}"
+    local api_key="${14}"
+
+    "$python_bin" - "$config_file" "$enabled" "$provider" "$endpoint" "$model" "$local_model" "$local_python" "$timeout_ms" "$min_chars" "$max_tokens" "$warmup_timeout_ms" "$enable_thinking" "$api_key" << 'PY'
+import json
+import os
+import sys
+from typing import Any
+
+
+def load_json(path: str) -> dict[str, Any]:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+target = os.path.expanduser(sys.argv[1])
+enabled = bool(int(sys.argv[2]))
+provider = sys.argv[3]
+endpoint = sys.argv[4]
+model = sys.argv[5]
+local_model = sys.argv[6]
+local_python = sys.argv[7]
+timeout_ms = int(sys.argv[8])
+min_chars = int(sys.argv[9])
+max_tokens = int(sys.argv[10])
+warmup_timeout_ms = int(sys.argv[11])
+enable_thinking = bool(int(sys.argv[12]))
+api_key = sys.argv[13]
+
+cfg = load_json(target)
+slm = cfg.get("slm", {})
+if not isinstance(slm, dict):
+    slm = {}
+
+slm.update(
+    {
+        "enabled": enabled,
+        "provider": provider,
+        "endpoint": endpoint,
+        "model": model,
+        "local_model": local_model,
+        "local_python": local_python,
+        "timeout_ms": timeout_ms,
+        "warmup_timeout_ms": warmup_timeout_ms,
+        "min_chars": min_chars,
+        "max_tokens": max_tokens,
+        "enable_thinking": enable_thinking,
+        "api_key": api_key,
+    }
+)
+cfg["slm"] = slm
+
+os.makedirs(os.path.dirname(target), exist_ok=True)
+with open(target, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+PY
+}
+
 echo "=== VoCoType Fcitx 5 语音输入法安装 ==="
 echo "项目目录: $PROJECT_DIR"
+echo ""
+
+echo "是否启用长句 SLM 润色（Shift+F9）？"
+echo "  [1] 不启用（默认）- 不安装 SLM 模型，保持最低资源占用"
+echo "  [2] 启用 - 配置 SLM 润色"
+echo ""
+read -r -p "请输入选项 (默认 1): " SLM_CHOICE
+case "$SLM_CHOICE" in
+    2)
+        ENABLE_SLM=1
+        echo ""
+        echo "您选择启用 SLM 润色。"
+        echo "请选择 SLM 运行方式："
+        echo "  [1] 本地一次性加载（推荐）：按下 Shift+F9 预加载，润色后释放"
+        echo "  [2] 远程 HTTP 服务：调用已有 endpoint（OpenAI 兼容）"
+        read -r -p "请输入选项 (默认 1): " SLM_PROVIDER_CHOICE
+
+        if [ "$SLM_PROVIDER_CHOICE" = "2" ]; then
+            SLM_PROVIDER="remote"
+            read -r -p "SLM 模型名 (默认 $SLM_MODEL): " SLM_MODEL_INPUT
+            if [ -n "$SLM_MODEL_INPUT" ]; then
+                SLM_MODEL="$SLM_MODEL_INPUT"
+            fi
+
+            read -r -p "SLM Endpoint (默认 $SLM_ENDPOINT): " SLM_ENDPOINT_INPUT
+            if [ -n "$SLM_ENDPOINT_INPUT" ]; then
+                SLM_ENDPOINT="$SLM_ENDPOINT_INPUT"
+            fi
+            read -r -s -p "SLM API Key（可留空，输入时不回显）: " SLM_API_KEY_INPUT
+            echo ""
+            if [ -n "$SLM_API_KEY_INPUT" ]; then
+                SLM_API_KEY="$SLM_API_KEY_INPUT"
+            fi
+        else
+            SLM_PROVIDER="local_ephemeral"
+            SLM_TIMEOUT_MS=12000
+            SLM_WARMUP_TIMEOUT_MS=90000
+            SLM_MAX_TOKENS=96
+            SLM_ENABLE_THINKING=0
+            SLM_API_KEY=""
+            read -r -p "本地模型名/路径 (默认 $SLM_LOCAL_MODEL): " SLM_LOCAL_MODEL_INPUT
+            if [ -n "$SLM_LOCAL_MODEL_INPUT" ]; then
+                SLM_LOCAL_MODEL="$SLM_LOCAL_MODEL_INPUT"
+                SLM_MODEL="$SLM_LOCAL_MODEL_INPUT"
+            fi
+            read -r -p "是否安装本地 SLM 依赖（torch/transformers/sentencepiece/socksio）? (Y/n): " INSTALL_SLM_DEPS
+            if [[ ! "$INSTALL_SLM_DEPS" =~ ^[Nn]$ ]]; then
+                SLM_INSTALL_LOCAL_DEPS=1
+            fi
+        fi
+        ;;
+    ""|1|*)
+        ENABLE_SLM=0
+        SLM_API_KEY=""
+        echo ""
+        echo "已禁用 SLM 润色（Shift+F9 不会触发润色）。"
+        ;;
+esac
 echo ""
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -359,6 +510,36 @@ else
 fi
 
 echo "✓ Python 环境已配置"
+
+if [ "$ENABLE_SLM" = "1" ] && [ "$SLM_PROVIDER" = "local_ephemeral" ] && [ "$SLM_INSTALL_LOCAL_DEPS" = "1" ]; then
+    echo ""
+    echo "安装本地 SLM 依赖（torch/transformers/sentencepiece/socksio）..."
+    if command -v uv &>/dev/null; then
+        uv pip install torch transformers sentencepiece socksio --python "$VENV_PYTHON"
+    else
+        "$VENV_PYTHON" -m pip install torch transformers sentencepiece socksio
+    fi
+fi
+
+echo ""
+echo "[可选] 写入 SLM 配置..."
+FCITX5_BACKEND_CONFIG="$HOME/.config/vocotype/fcitx5-backend.json"
+write_slm_config_json \
+    "$FCITX5_BACKEND_CONFIG" \
+    "$VENV_PYTHON" \
+    "$ENABLE_SLM" \
+    "$SLM_PROVIDER" \
+    "$SLM_ENDPOINT" \
+    "$SLM_MODEL" \
+    "$SLM_LOCAL_MODEL" \
+    "$SLM_LOCAL_PYTHON" \
+    "$SLM_TIMEOUT_MS" \
+    "$SLM_MIN_CHARS" \
+    "$SLM_MAX_TOKENS" \
+    "$SLM_WARMUP_TIMEOUT_MS" \
+    "$SLM_ENABLE_THINKING" \
+    "$SLM_API_KEY"
+echo "✓ 已写入配置: $FCITX5_BACKEND_CONFIG"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 8. Rime 输入方案选择（可选）

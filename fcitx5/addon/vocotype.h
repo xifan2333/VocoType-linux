@@ -2,7 +2,8 @@
  * VoCoType Fcitx5 Addon
  *
  * 语音 + Rime 拼音输入法
- * - F9: 按住录音，松开识别
+ * - F9: 按住录音，松开识别（极速模式）
+ * - Shift+F9: 长句模式，松开后识别并可选 SLM 润色
  * - 其他键: Rime 拼音输入
  */
 
@@ -50,7 +51,7 @@ private:
     /**
      * F9 按下：开始录音
      */
-    void startRecording(fcitx::InputContext* ic);
+    void startRecording(fcitx::InputContext* ic, bool long_mode);
 
     /**
      * F9 松开：停止录音并转录
@@ -92,6 +93,7 @@ private:
 
     // 录音状态
     bool is_recording_ = false;
+    bool recording_long_mode_ = false;
     pid_t recorder_pid_ = -1;
     int recorder_stdin_fd_ = -1;
     FILE* recorder_stdout_ = nullptr;
