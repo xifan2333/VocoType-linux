@@ -14,6 +14,7 @@ import logging
 import signal
 import stat
 import threading
+import time
 from pathlib import Path
 
 # 添加项目根目录到 path
@@ -23,6 +24,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from app.config import DEFAULT_CONFIG, ensure_logging_dir, load_config
 from app.funasr_server import FunASRServer
 from app.logging_config import setup_logging
+from app.slm_polisher import SLMPolisher
 from backend.rime_handler import RimeHandler
 
 logger = logging.getLogger(__name__)
@@ -65,7 +67,9 @@ class Fcitx5Backend:
     3. 通过 IPC 返回结果给 C++ Addon
     """
 
-    def __init__(self):
+    def __init__(self, config: dict | None = None):
+        self.config = dict(config or DEFAULT_CONFIG)
+
         # 语音识别服务
         logger.info("正在初始化 FunASR 服务器...")
         self.asr_server = FunASRServer()
@@ -74,6 +78,10 @@ class Fcitx5Backend:
             logger.error("FunASR 初始化失败: %s", asr_result.get('error'))
             sys.exit(1)
         logger.info("FunASR 服务器初始化成功")
+
+        self._asr_options = dict(self.config.get("asr", {}))
+        self._slm_polisher = SLMPolisher(self.config.get("slm", {}))
+        logger.info("SLM 长句润色: enabled=%s", self._slm_polisher.enabled)
 
         # Rime 处理器
         self.rime_handler = RimeHandler()
@@ -163,18 +171,26 @@ class Fcitx5Backend:
 
         请求类型：
         1. transcribe: 语音识别
-           {"type": "transcribe", "audio_path": "/tmp/xxx.wav"}
+           {"type": "transcribe", "audio_path": "/tmp/xxx.wav", "long_mode": false}
            -> {"success": true, "text": "识别结果"}
 
-        2. key_event: Rime 按键处理
+        2. slm_prewarm: 预加载 SLM（长句模式按下时调用）
+           {"type": "slm_prewarm"}
+           -> {"success": true}
+
+        3. slm_release: 释放 SLM（长句流程结束时调用）
+           {"type": "slm_release"}
+           -> {"success": true}
+
+        4. key_event: Rime 按键处理
            {"type": "key_event", "keyval": 97, "mask": 0}
            -> {"handled": true, "commit": "...", "preedit": {...}, ...}
 
-        3. reset: 重置 Rime 状态
+        5. reset: 重置 Rime 状态
            {"type": "reset"}
            -> {"success": true}
 
-        4. ping: 健康检查
+        6. ping: 健康检查
            {"type": "ping"}
            -> {"pong": true}
         """
@@ -206,12 +222,82 @@ class Fcitx5Backend:
             if req_type == 'transcribe':
                 # 语音识别
                 audio_path = request.get('audio_path')
+                long_mode = bool(request.get('long_mode', False))
                 if not audio_path:
                     response = {"success": False, "error": "缺少 audio_path 参数"}
                 else:
-                    with self._asr_lock:
-                        result = self.asr_server.transcribe_audio(audio_path)
-                    response = result
+                    try:
+                        asr_start = time.perf_counter()
+                        with self._asr_lock:
+                            result = self.asr_server.transcribe_audio(
+                                audio_path,
+                                options=self._asr_options,
+                            )
+                        asr_ms = (time.perf_counter() - asr_start) * 1000.0
+
+                        slm_used = False
+                        slm_ms = 0.0
+                        slm_reason = "not_used"
+                        if result.get("success"):
+                            text = str(result.get("text", "")).strip()
+                            if text:
+                                should_polish = (
+                                    long_mode
+                                    and self._slm_polisher.should_polish(
+                                        text,
+                                        long_mode=True,
+                                    )
+                                )
+                                if should_polish:
+                                    polished_text, metrics = self._slm_polisher.polish(
+                                        text,
+                                        long_mode=long_mode,
+                                    )
+                                    slm_used = metrics.used
+                                    slm_ms = metrics.latency_ms
+                                    slm_reason = metrics.reason
+                                    if self._slm_polisher.is_failure_reason(metrics.reason):
+                                        logger.warning(
+                                            "长句 SLM 调用失败: reason=%s",
+                                            metrics.reason,
+                                        )
+                                        result = {
+                                            "success": False,
+                                            "error": self._slm_polisher.format_failure_message(
+                                                metrics.reason
+                                            ),
+                                        }
+                                    else:
+                                        result["text"] = polished_text
+                                elif long_mode:
+                                    slm_reason = (
+                                        "disabled"
+                                        if not self._slm_polisher.enabled
+                                        else "too_short"
+                                    )
+                            else:
+                                slm_reason = "empty_asr_text"
+
+                        logger.info(
+                            "Fcitx 转录流水线 mode=%s asr_ms=%.2f slm_used=%s slm_ms=%.2f fallback_reason=%s",
+                            "long" if long_mode else "normal",
+                            asr_ms,
+                            slm_used,
+                            slm_ms,
+                            slm_reason,
+                        )
+                        response = result
+                    finally:
+                        if long_mode:
+                            self._slm_polisher.release()
+
+            elif req_type == 'slm_prewarm':
+                self._slm_polisher.prewarm(long_mode=True)
+                response = {"success": True}
+
+            elif req_type == 'slm_release':
+                self._slm_polisher.release()
+                response = {"success": True}
 
             elif req_type == 'key_event':
                 # Rime 按键处理
@@ -308,7 +394,7 @@ def main():
 
     SOCKET_PATH = args.socket
 
-    backend = Fcitx5Backend()
+    backend = Fcitx5Backend(config=config)
     try:
         backend.run()
     except KeyboardInterrupt:

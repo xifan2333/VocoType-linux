@@ -56,7 +56,7 @@ std::string stopRecorderProcess(pid_t pid, int stdin_fd, FILE* stdout_file) {
 
 namespace vocotype {
 
-// F9 键
+// F9 键（Shift+F9 使用同一个 keyval，通过 modifier 区分）
 constexpr int PTT_KEYVAL = FcitxKey_F9;
 
 VoCoTypeAddon::VoCoTypeAddon(fcitx::Instance* instance)
@@ -131,8 +131,9 @@ void VoCoTypeAddon::keyEvent(const fcitx::InputMethodEntry& entry,
             }
         } else {
             // F9 按下：开始录音
+            const bool long_mode = (key.states() & fcitx::KeyState::Shift);
             if (!is_recording_) {
-                startRecording(ic);
+                startRecording(ic, long_mode);
             }
         }
         keyEvent.filterAndAccept();
@@ -210,7 +211,7 @@ void VoCoTypeAddon::deactivate(const fcitx::InputMethodEntry& entry,
     FCITX_DEBUG() << "VoCoType deactivated";
 }
 
-void VoCoTypeAddon::startRecording(fcitx::InputContext* ic) {
+void VoCoTypeAddon::startRecording(fcitx::InputContext* ic, bool long_mode) {
     if (is_recording_) {
         return;
     }
@@ -276,16 +277,28 @@ void VoCoTypeAddon::startRecording(fcitx::InputContext* ic) {
     recorder_stdin_fd_ = stdin_pipe[1];
     recorder_stdout_ = stdout_file;
     is_recording_ = true;
+    recording_long_mode_ = long_mode;
+
+    // 长句模式按下时并行预加载本地 SLM，减少松键后等待
+    if (long_mode) {
+        std::thread([this]() {
+            (void)ipc_client_->prewarmSlm();
+        }).detach();
+    }
 
     // 显示录音状态
     auto& inputPanel = ic->inputPanel();
     fcitx::Text preedit;
-    preedit.append("🎤 录音中...");
+    if (long_mode) {
+        preedit.append("🎤 录音中(长句)...");
+    } else {
+        preedit.append("🎤 录音中...");
+    }
     inputPanel.setClientPreedit(preedit);
     ic->updatePreedit();
     ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
 
-    FCITX_INFO() << "Recording started";
+    FCITX_INFO() << "Recording started, mode=" << (long_mode ? "long" : "normal");
 }
 
 void VoCoTypeAddon::stopAndTranscribe(fcitx::InputContext* ic) {
@@ -298,17 +311,28 @@ void VoCoTypeAddon::stopRecording(fcitx::InputContext* ic, bool transcribe) {
     }
 
     is_recording_ = false;
+    const bool long_mode = recording_long_mode_;
+    recording_long_mode_ = false;
 
     if (ic) {
         if (transcribe) {
             auto& inputPanel = ic->inputPanel();
             fcitx::Text preedit;
-            preedit.append("⏳ 识别中...");
+            if (long_mode) {
+                preedit.append("⏳ 识别+润色中...");
+            } else {
+                preedit.append("⏳ 识别中...");
+            }
             inputPanel.setClientPreedit(preedit);
             ic->updatePreedit();
             ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
         } else {
             clearUI(ic);
+            if (long_mode) {
+                std::thread([this]() {
+                    (void)ipc_client_->releaseSlm();
+                }).detach();
+            }
         }
     }
 
@@ -322,7 +346,7 @@ void VoCoTypeAddon::stopRecording(fcitx::InputContext* ic, bool transcribe) {
     auto ic_ref =
         ic ? ic->watch() : fcitx::TrackableObjectReference<fcitx::InputContext>();
 
-    std::thread([this, pid, stdin_fd, stdout_file, transcribe, ic_ref]() mutable {
+    std::thread([this, pid, stdin_fd, stdout_file, transcribe, long_mode, ic_ref]() mutable {
         std::string audio_path = stopRecorderProcess(pid, stdin_fd, stdout_file);
         if (audio_path.empty()) {
             if (transcribe) {
@@ -342,7 +366,7 @@ void VoCoTypeAddon::stopRecording(fcitx::InputContext* ic, bool transcribe) {
             return;
         }
 
-        TranscribeResult result = ipc_client_->transcribeAudio(audio_path);
+        TranscribeResult result = ipc_client_->transcribeAudio(audio_path, long_mode);
         std::remove(audio_path.c_str());
 
         instance_->eventDispatcher().scheduleWithContext(
@@ -362,7 +386,7 @@ void VoCoTypeAddon::stopRecording(fcitx::InputContext* ic, bool transcribe) {
             });
     }).detach();
 
-    FCITX_INFO() << "Recording stopped";
+    FCITX_INFO() << "Recording stopped, mode=" << (long_mode ? "long" : "normal");
 }
 
 void VoCoTypeAddon::updateUI(fcitx::InputContext* ic, const RimeUIState& state) {

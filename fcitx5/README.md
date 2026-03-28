@@ -4,7 +4,7 @@ VoCoType 离线语音输入法的 Fcitx 5 版本实现。
 
 ## 功能特性
 
-- **语音输入** - 按住 F9 说话，松开自动识别并输入
+- **语音输入** - 按住 F9 说话，松开自动识别并输入；`Shift+F9` 为长句模式（可选 SLM 润色）
 - **Rime 拼音** - 完整的 Rime 拼音输入支持
 - **完全离线** - 所有识别在本地完成，零网络依赖
 - **轻量高效** - 纯 CPU 推理，仅需 700MB 内存
@@ -16,7 +16,7 @@ VoCoType 离线语音输入法的 Fcitx 5 版本实现。
 Fcitx 5 Framework
     ↓ (C++ API)
 C++ Addon (fcitx5/addon/)
-    ├─ 监听 F9 按键（语音）
+    ├─ 监听 F9/Shift+F9 按键（语音）
     ├─ 监听其他按键（Rime）
     └─ 更新 UI
     ↓ (Unix Socket IPC)
@@ -61,6 +61,10 @@ bash fcitx5/scripts/install-fcitx5.sh
 4. 配置 Python 虚拟环境（支持手动指定 conda 解释器）
 5. 配置音频设备（可选）
 6. 创建 systemd 服务
+
+安装脚本还会询问是否启用 `Shift+F9` 长句 SLM 润色：
+- 不启用（默认）：不安装/拉取 SLM 模型，`Shift+F9` 不会触发润色
+- 启用：写入 `~/.config/vocotype/fcitx5-backend.json` 的 `slm` 配置，支持本地一次性加载
 
 ### 手动安装
 
@@ -147,6 +151,35 @@ journalctl --user -u vocotype-fcitx5-backend.service -f
 
 日志目录默认是 `~/.local/share/vocotype-fcitx5/logs/`。
 
+### 长句模式（Shift+F9）配置
+
+在 `~/.config/vocotype/fcitx5-backend.json` 中配置 `slm`（默认关闭）。
+
+推荐使用本地一次性加载（按下 `Shift+F9` 预加载，润色后立即释放）：
+
+```json
+{
+  "slm": {
+    "enabled": true,
+    "provider": "local_ephemeral",
+    "model": "Qwen/Qwen3.5-0.8B",
+    "local_model": "Qwen/Qwen3.5-0.8B",
+    "warmup_timeout_ms": 90000,
+    "keepalive_ms": 60000,
+    "ready_wait_ms": 2000,
+    "timeout_ms": 12000,
+    "min_chars": 8,
+    "max_tokens": 96,
+    "enable_thinking": false
+  }
+}
+```
+
+- `F9` 不会触发 SLM，保持低延迟
+- `Shift+F9` 才会触发 SLM
+- `local_ephemeral` 会在每次长句流程结束后释放模型内存
+- 若 SLM 调用失败，会显示错误提示，不提交回退原文
+
 ### 2. 重启 Fcitx 5
 
 ```bash
@@ -168,7 +201,9 @@ fcitx5 -r
 
 ### 4. 开始使用
 
-- **语音输入**: 按住 F9 说话，松开后自动识别
+- **语音输入**:
+  - 按住 `F9`：极速模式（仅 ASR + 标点）
+  - 按住 `Shift+F9`：长句模式（ASR + 标点 + 可选 SLM 润色）
 - **拼音输入**: 正常打字，使用 Rime 拼音输入
 
 ## Rime 配置

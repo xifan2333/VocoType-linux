@@ -4,7 +4,7 @@ VoCoType 离线语音输入法的 IBus 版本实现。
 
 ## 功能特性
 
-- **语音输入** - 按住 F9 说话，松开自动识别并输入
+- **语音输入** - 按住 F9 说话，松开自动识别并输入；`Shift+F9` 为长句模式（可选 SLM 润色）
 - **Rime 拼音** - 完整版支持 Rime 拼音输入
 - **完全离线** - 所有识别在本地完成，零网络依赖
 - **轻量高效** - 纯 CPU 推理，仅需 700MB 内存
@@ -26,8 +26,8 @@ VoCoType 离线语音输入法的 IBus 版本实现。
 
 | 版本 | 功能 | 适用场景 |
 |------|------|---------|
-| **纯语音版** | F9 语音输入 | 只需要语音输入，使用其他拼音输入法 |
-| **完整版** | F9 语音 + Rime 拼音 | 一个输入法同时支持语音和拼音 |
+| **纯语音版** | F9 极速语音输入 + Shift+F9 长句模式 | 只需要语音输入，使用其他拼音输入法 |
+| **完整版** | F9 语音 + Shift+F9 长句 + Rime 拼音 | 一个输入法同时支持语音和拼音 |
 
 ## 安装
 
@@ -48,6 +48,10 @@ ibus restart
 - 用户级虚拟环境 (`~/.local/share/vocotype/.venv`)
 - 系统 Python（省空间，需自行安装依赖）
 - 手动指定 Python 解释器（例如 conda 环境的 `python`）
+
+安装脚本还会询问是否启用 `Shift+F9` 长句 SLM 润色：
+- 不启用（默认）：不安装/拉取 SLM 模型，`Shift+F9` 不会触发润色
+- 启用：写入 `~/.config/vocotype/ibus.json` 的 `slm` 配置，支持本地一次性加载
 
 > **模型下载**：首次运行时，程序会自动下载约 500MB 的模型文件。
 
@@ -95,7 +99,9 @@ ibus restart
 ### 2. 开始使用
 
 1. 切换到 VoCoType 输入法 (通常是 `Super + Space` 或 `Ctrl + Space`)
-2. **语音输入**: 按住 F9 说话，松开后自动识别
+2. **语音输入**:
+   - 按住 `F9`：极速模式（仅 ASR + 标点）
+   - 按住 `Shift+F9`：长句模式（ASR + 标点 + 可选 SLM 润色）
 3. **拼音输入**（完整版）: 直接打字，Rime 处理并显示候选词
 
 ## Rime 配置
@@ -133,6 +139,35 @@ PTT_KEYVAL = IBus.KEY_F9  # 修改为其他按键
 ```
 
 可选按键：`IBus.KEY_F8`, `IBus.KEY_F10`, `IBus.KEY_Control_L` 等
+
+### 长句模式（Shift+F9）配置
+
+在 `~/.config/vocotype/ibus.json` 中配置 `slm`（默认关闭）。
+
+推荐使用本地一次性加载（按下 `Shift+F9` 预加载，润色后立即释放）：
+
+```json
+{
+  "slm": {
+    "enabled": true,
+    "provider": "local_ephemeral",
+    "model": "Qwen/Qwen3.5-0.8B",
+    "local_model": "Qwen/Qwen3.5-0.8B",
+    "warmup_timeout_ms": 90000,
+    "keepalive_ms": 60000,
+    "ready_wait_ms": 2000,
+    "timeout_ms": 12000,
+    "min_chars": 8,
+    "max_tokens": 96,
+    "enable_thinking": false
+  }
+}
+```
+
+- `F9` 不会触发 SLM，保持低延迟
+- `Shift+F9` 才会触发 SLM
+- `local_ephemeral` 会在每次长句流程结束后释放模型内存
+- 若 SLM 调用失败，会显示错误提示，不提交回退原文
 
 ## 常见问题 (FAQ)
 

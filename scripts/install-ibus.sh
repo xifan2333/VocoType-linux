@@ -108,6 +108,84 @@ print_python_help() {
     echo "    conda activate vocotype"
 }
 
+write_slm_config_json() {
+    local config_file="$1"
+    local python_bin="$2"
+    local enabled="$3"
+    local provider="$4"
+    local endpoint="$5"
+    local model="$6"
+    local local_model="$7"
+    local local_python="$8"
+    local timeout_ms="$9"
+    local min_chars="${10}"
+    local max_tokens="${11}"
+    local warmup_timeout_ms="${12}"
+    local enable_thinking="${13}"
+    local api_key="${14}"
+
+    "$python_bin" - "$config_file" "$enabled" "$provider" "$endpoint" "$model" "$local_model" "$local_python" "$timeout_ms" "$min_chars" "$max_tokens" "$warmup_timeout_ms" "$enable_thinking" "$api_key" << 'PY'
+import json
+import os
+import sys
+from typing import Any
+
+
+def load_json(path: str) -> dict[str, Any]:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+target = os.path.expanduser(sys.argv[1])
+enabled = bool(int(sys.argv[2]))
+provider = sys.argv[3]
+endpoint = sys.argv[4]
+model = sys.argv[5]
+local_model = sys.argv[6]
+local_python = sys.argv[7]
+timeout_ms = int(sys.argv[8])
+min_chars = int(sys.argv[9])
+max_tokens = int(sys.argv[10])
+warmup_timeout_ms = int(sys.argv[11])
+enable_thinking = bool(int(sys.argv[12]))
+api_key = sys.argv[13]
+
+cfg = load_json(target)
+slm = cfg.get("slm", {})
+if not isinstance(slm, dict):
+    slm = {}
+
+slm.update(
+    {
+        "enabled": enabled,
+        "provider": provider,
+        "endpoint": endpoint,
+        "model": model,
+        "local_model": local_model,
+        "local_python": local_python,
+        "timeout_ms": timeout_ms,
+        "warmup_timeout_ms": warmup_timeout_ms,
+        "min_chars": min_chars,
+        "max_tokens": max_tokens,
+        "enable_thinking": enable_thinking,
+        "api_key": api_key,
+    }
+)
+cfg["slm"] = slm
+
+os.makedirs(os.path.dirname(target), exist_ok=True)
+with open(target, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+PY
+}
+
 # 检测 IBus 引擎必需的系统构建依赖（用于编译 pycairo/pygobject）
 check_build_deps() {
     local missing=""
@@ -145,10 +223,33 @@ check_build_deps() {
     echo "$missing"
 }
 
+check_ibus_import() {
+    "$1" - << 'PY' >/dev/null 2>&1
+import gi
+gi.require_version("IBus", "1.0")
+from gi.repository import IBus  # noqa: F401
+PY
+}
+
 # 用户级安装路径
 INSTALL_DIR="$HOME/.local/share/vocotype"
 COMPONENT_DIR="$HOME/.local/share/ibus/component"
 LIBEXEC_DIR="$HOME/.local/libexec"
+
+# SLM 可选配置（默认关闭）
+ENABLE_SLM=0
+SLM_PROVIDER="local_ephemeral"
+SLM_ENDPOINT="http://127.0.0.1:18080/v1/chat/completions"
+SLM_MODEL="Qwen/Qwen3.5-0.8B"
+SLM_LOCAL_MODEL="$SLM_MODEL"
+SLM_LOCAL_PYTHON=""
+SLM_TIMEOUT_MS=600
+SLM_WARMUP_TIMEOUT_MS=12000
+SLM_MIN_CHARS=8
+SLM_MAX_TOKENS=24
+SLM_ENABLE_THINKING=0
+SLM_API_KEY=""
+SLM_INSTALL_LOCAL_DEPS=0
 
 echo "=== VoCoType IBus 语音输入法安装 ==="
 echo "项目目录: $PROJECT_DIR"
@@ -240,6 +341,65 @@ case "$INSTALL_TYPE" in
         ENABLE_RIME=0
         echo ""
         echo "您选择了纯语音版"
+        ;;
+esac
+
+echo ""
+
+echo "是否启用长句 SLM 润色（Shift+F9）？"
+echo "  [1] 不启用（默认）- 不安装 SLM 模型，保持最低资源占用"
+echo "  [2] 启用 - 配置 SLM 润色"
+echo ""
+read -r -p "请输入选项 (默认 1): " SLM_CHOICE
+case "$SLM_CHOICE" in
+    2)
+        ENABLE_SLM=1
+        echo ""
+        echo "您选择启用 SLM 润色。"
+        echo "请选择 SLM 运行方式："
+        echo "  [1] 本地一次性加载（推荐）：按下 Shift+F9 预加载，润色后释放"
+        echo "  [2] 远程 HTTP 服务：调用已有 endpoint（OpenAI 兼容）"
+        read -r -p "请输入选项 (默认 1): " SLM_PROVIDER_CHOICE
+
+        if [ "$SLM_PROVIDER_CHOICE" = "2" ]; then
+            SLM_PROVIDER="remote"
+            read -r -p "SLM 模型名 (默认 $SLM_MODEL): " SLM_MODEL_INPUT
+            if [ -n "$SLM_MODEL_INPUT" ]; then
+                SLM_MODEL="$SLM_MODEL_INPUT"
+            fi
+
+            read -r -p "SLM Endpoint (默认 $SLM_ENDPOINT): " SLM_ENDPOINT_INPUT
+            if [ -n "$SLM_ENDPOINT_INPUT" ]; then
+                SLM_ENDPOINT="$SLM_ENDPOINT_INPUT"
+            fi
+            read -r -s -p "SLM API Key（可留空，输入时不回显）: " SLM_API_KEY_INPUT
+            echo ""
+            if [ -n "$SLM_API_KEY_INPUT" ]; then
+                SLM_API_KEY="$SLM_API_KEY_INPUT"
+            fi
+        else
+            SLM_PROVIDER="local_ephemeral"
+            SLM_TIMEOUT_MS=12000
+            SLM_WARMUP_TIMEOUT_MS=90000
+            SLM_MAX_TOKENS=96
+            SLM_ENABLE_THINKING=0
+            SLM_API_KEY=""
+            read -r -p "本地模型名/路径 (默认 $SLM_LOCAL_MODEL): " SLM_LOCAL_MODEL_INPUT
+            if [ -n "$SLM_LOCAL_MODEL_INPUT" ]; then
+                SLM_LOCAL_MODEL="$SLM_LOCAL_MODEL_INPUT"
+                SLM_MODEL="$SLM_LOCAL_MODEL_INPUT"
+            fi
+            read -r -p "是否安装本地 SLM 依赖（torch/transformers/sentencepiece/socksio）? (Y/n): " INSTALL_SLM_DEPS
+            if [[ ! "$INSTALL_SLM_DEPS" =~ ^[Nn]$ ]]; then
+                SLM_INSTALL_LOCAL_DEPS=1
+            fi
+        fi
+        ;;
+    ""|1|*)
+        ENABLE_SLM=0
+        SLM_API_KEY=""
+        echo ""
+        echo "已禁用 SLM 润色（Shift+F9 不会触发润色）。"
         ;;
 esac
 
@@ -594,6 +754,51 @@ else
     fi
 fi
 
+# 验证 IBus GI 绑定可用（避免 Python 3.12 + PyGObject 3.42 导致引擎无法启动）
+if ! check_ibus_import "$PYTHON"; then
+    echo ""
+    echo "⚠️  当前 Python 环境无法导入 gi.repository.IBus，尝试自动修复..."
+
+    if [ "$USE_SYSTEM_PYTHON" = "1" ]; then
+        echo "系统 Python 缺少可用 IBus 绑定。请先安装系统包后重试："
+        echo "  Fedora: sudo dnf install python3-gobject ibus"
+        echo "  Debian/Ubuntu: sudo apt install python3-gi gir1.2-ibus-1.0"
+        exit 1
+    fi
+
+    if command -v uv >/dev/null 2>&1; then
+        uv pip install --python "$PYTHON" -U "PyGObject>=3.56.0"
+    else
+        "$PYTHON" -m pip install -U "PyGObject>=3.56.0"
+    fi
+
+    if ! check_ibus_import "$PYTHON"; then
+        echo "❌ 自动修复失败：仍无法导入 gi.repository.IBus"
+        echo "   请检查是否安装系统依赖：python3-gi 与 IBus gobject-introspection 包"
+        exit 1
+    fi
+
+    echo "✓ IBus 绑定修复成功"
+fi
+
+if [ "$ENABLE_SLM" = "1" ] && [ "$SLM_PROVIDER" = "local_ephemeral" ] && [ "$SLM_INSTALL_LOCAL_DEPS" = "1" ]; then
+    echo ""
+    echo "安装本地 SLM 依赖（torch/transformers/sentencepiece/socksio）..."
+    if [ "$USE_SYSTEM_PYTHON" = "1" ]; then
+        if ! "$PYTHON" -c "import torch, transformers, sentencepiece, socksio" >/dev/null 2>&1; then
+            echo "⚠️  系统 Python 缺少本地 SLM 依赖，请手动安装："
+            echo "  $PYTHON -m pip install torch transformers sentencepiece socksio"
+            echo "   或改用虚拟环境重新安装。"
+        fi
+    else
+        if command -v uv >/dev/null 2>&1; then
+            uv pip install --python "$PYTHON" torch transformers sentencepiece socksio
+        else
+            "$PYTHON" -m pip install torch transformers sentencepiece socksio
+        fi
+    fi
+fi
+
 # 2. 音频设备配置
 echo "[2/6] 音频设备配置..."
 
@@ -629,6 +834,26 @@ else
 fi
 
 echo ""
+
+# 写入 IBus 运行时 SLM 配置
+echo "[可选] 写入 SLM 配置..."
+IBUS_RUNTIME_CONFIG="$HOME/.config/vocotype/ibus.json"
+write_slm_config_json \
+    "$IBUS_RUNTIME_CONFIG" \
+    "$PYTHON" \
+    "$ENABLE_SLM" \
+    "$SLM_PROVIDER" \
+    "$SLM_ENDPOINT" \
+    "$SLM_MODEL" \
+    "$SLM_LOCAL_MODEL" \
+    "$SLM_LOCAL_PYTHON" \
+    "$SLM_TIMEOUT_MS" \
+    "$SLM_MIN_CHARS" \
+    "$SLM_MAX_TOKENS" \
+    "$SLM_WARMUP_TIMEOUT_MS" \
+    "$SLM_ENABLE_THINKING" \
+    "$SLM_API_KEY"
+echo "✓ 已写入配置: $IBUS_RUNTIME_CONFIG"
 
 # 3. 复制项目文件
 echo "[3/6] 复制项目文件..."
