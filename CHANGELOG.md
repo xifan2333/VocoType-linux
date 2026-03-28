@@ -5,6 +5,36 @@ All notable changes to VoCoType Linux IBus will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-03-28 (pre-release)
+
+### Added
+
+- **新增 LLM 后处理链路（长句模式）**：
+  - `Shift+F9` 新增长句模式后处理（ASR + 标点 + 可选 SLM/LLM 润色）
+  - 新增本地一次性加载 worker：按下预热、释放后自动回收
+  - 新增后处理基准脚本：`scripts/benchmark_slm_pipeline.py`
+  - 新增后处理单元测试：`test/test_slm_polisher.py`
+
+### Changed
+
+- **安装脚本增强（IBus/Fcitx5）**：
+  - SLM 保持可选安装，不启用时不安装模型
+  - 启用后可交互选择：
+    - 本地模型（`local_ephemeral`）
+    - 远程 API（`remote`）
+  - 远程 API 模式支持交互写入：`model`、`endpoint`、`api_key`
+- **默认阈值优化**：
+  - `min_chars` 默认从 `20` 下调到 `8`，减少长句模式被 `too_short` 跳过的概率
+- **远程稳定性改进**：
+  - 远程请求失败时增加“直连重试（绕过代理）”机制，降低代理环境下的偶发失败
+
+### Documentation
+
+- 更新根文档、IBus、Fcitx5 文档：
+  - 新增本地模型与远程 API 两种配置方式
+  - 补充 SLM 参数说明和使用建议
+  - 补充失败提示与调试方式
+
 ## [2.1.2] - 2026-01-21
 
 ### Fixed

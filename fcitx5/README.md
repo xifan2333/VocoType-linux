@@ -64,7 +64,9 @@ bash fcitx5/scripts/install-fcitx5.sh
 
 安装脚本还会询问是否启用 `Shift+F9` 长句 SLM 润色：
 - 不启用（默认）：不安装/拉取 SLM 模型，`Shift+F9` 不会触发润色
-- 启用：写入 `~/.config/vocotype/fcitx5-backend.json` 的 `slm` 配置，支持本地一次性加载
+- 启用：写入 `~/.config/vocotype/fcitx5-backend.json` 的 `slm` 配置，并可选择：
+  - 本地模型（`local_ephemeral`）：按下预热，润色后释放
+  - 远程 API（`remote`）：配置 `model`、`endpoint`、`api_key`
 
 ### 手动安装
 
@@ -179,6 +181,31 @@ journalctl --user -u vocotype-fcitx5-backend.service -f
 - `Shift+F9` 才会触发 SLM
 - `local_ephemeral` 会在每次长句流程结束后释放模型内存
 - 若 SLM 调用失败，会显示错误提示，不提交回退原文
+
+远程 API（OpenAI 兼容）示例：
+
+```json
+{
+  "slm": {
+    "enabled": true,
+    "provider": "remote",
+    "model": "gpt-4o",
+    "endpoint": "http://<host>:<port>/v1/chat/completions",
+    "api_key": "sk-***",
+    "timeout_ms": 20000,
+    "min_chars": 8,
+    "max_tokens": 128,
+    "retry_without_proxy": true
+  }
+}
+```
+
+常用参数：
+- `provider`：`local_ephemeral` / `remote`
+- `min_chars`：长句触发阈值（默认 `8`）
+- `max_tokens`：润色输出预算
+- `enable_thinking`：是否允许思考输出（默认 `false`）
+- `retry_without_proxy`：远程请求失败时绕过代理直连重试（默认 `true`）
 
 ### 2. 重启 Fcitx 5
 

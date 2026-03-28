@@ -938,7 +938,7 @@ fi
 # 6. 安装IBus组件文件
 echo "[6/6] 安装IBus组件配置..."
 EXEC_PATH="$LIBEXEC_DIR/ibus-engine-vocotype"
-VOCOTYPE_VERSION="2.1.1"
+VOCOTYPE_VERSION="2.2.0"
 if VOCOTYPE_VERSION=$(PYTHONPATH="$PROJECT_DIR" "$PYTHON" - << 'PY'
 from vocotype_version import __version__
 print(__version__)
@@ -946,7 +946,7 @@ PY
 ); then
     :
 else
-    VOCOTYPE_VERSION="2.1.1"
+    VOCOTYPE_VERSION="2.2.0"
 fi
 
 # GNOME 环境下 XDG_DATA_DIRS 不包含用户目录，需要安装到系统目录

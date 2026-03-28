@@ -46,7 +46,9 @@ ibus restart
 
 安装脚本会询问是否启用 `Shift+F9` 长句 SLM 润色：
 - 不启用（默认）：不安装/拉取 SLM 模型，`Shift+F9` 不会触发润色
-- 启用：写入 SLM 配置，支持本地一次性加载（按下预加载、润色后释放）
+- 启用：可选择
+  - 本地模型（`local_ephemeral`）：按下预热，润色后释放
+  - 远程 API（`remote`）：交互配置 `model`、`endpoint`、`api_key`
 
 详细安装说明：[ibus/README.md](ibus/README.md)
 
@@ -61,9 +63,62 @@ fcitx5 -r
 
 安装脚本会询问是否启用 `Shift+F9` 长句 SLM 润色：
 - 不启用（默认）：不安装/拉取 SLM 模型，`Shift+F9` 不会触发润色
-- 启用：写入 SLM 配置，支持本地一次性加载（按下预加载、润色后释放）
+- 启用：可选择
+  - 本地模型（`local_ephemeral`）：按下预热，润色后释放
+  - 远程 API（`remote`）：交互配置 `model`、`endpoint`、`api_key`
 
 详细安装说明：[fcitx5/README.md](fcitx5/README.md)
+
+---
+
+## SLM 后处理配置（通用）
+
+`F9` 为极速模式（不走 SLM），`Shift+F9` 为长句模式（可选 SLM/LLM 润色）。
+
+### 本地模型（推荐，按需加载）
+
+```json
+{
+  "slm": {
+    "enabled": true,
+    "provider": "local_ephemeral",
+    "model": "Qwen/Qwen3.5-0.8B",
+    "local_model": "Qwen/Qwen3.5-0.8B",
+    "timeout_ms": 12000,
+    "warmup_timeout_ms": 90000,
+    "ready_wait_ms": 2000,
+    "keepalive_ms": 60000,
+    "min_chars": 8,
+    "max_tokens": 96,
+    "enable_thinking": false
+  }
+}
+```
+
+### 远程 API（OpenAI 兼容）
+
+```json
+{
+  "slm": {
+    "enabled": true,
+    "provider": "remote",
+    "model": "gpt-4o",
+    "endpoint": "http://<host>:<port>/v1/chat/completions",
+    "api_key": "sk-***",
+    "timeout_ms": 20000,
+    "min_chars": 8,
+    "max_tokens": 128,
+    "retry_without_proxy": true
+  }
+}
+```
+
+关键参数说明：
+- `provider`：`local_ephemeral` / `remote`
+- `min_chars`：长句触发阈值（默认 `8`）
+- `max_tokens`：润色输出预算
+- `enable_thinking`：是否允许思考输出（默认关闭）
+- `retry_without_proxy`：远程请求失败时尝试绕过代理直连重试
 
 ---
 
