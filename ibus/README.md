@@ -5,6 +5,8 @@ VoCoType 离线语音输入法的 IBus 版本实现。
 ## 功能特性
 
 - **语音输入** - 按住 F9 说话，松开自动识别并输入；`Shift+F9` 为长句模式（可选 SLM 润色）
+- **语音编辑** - `Ctrl+F9` 读取输入框上下文并执行语音编辑指令（替换/删除/插入/导航/撤销重做）
+- **上下文探针** - `Ctrl+Shift+F9` 输出 surrounding 调试信息，便于验证不同应用兼容性
 - **Rime 拼音** - 完整版支持 Rime 拼音输入
 - **完全离线** - 所有识别在本地完成，零网络依赖
 - **轻量高效** - 纯 CPU 推理，仅需 700MB 内存
@@ -104,6 +106,8 @@ ibus restart
 2. **语音输入**:
    - 按住 `F9`：极速模式（仅 ASR + 标点）
    - 按住 `Shift+F9`：长句模式（ASR + 标点 + 可选 SLM 润色）
+   - 按住 `Ctrl+F9`：语音编辑模式（读取 surrounding + 识别编辑指令）
+   - 按住 `Ctrl+Shift+F9`：输出 surrounding 探针信息
 3. **拼音输入**（完整版）: 直接打字，Rime 处理并显示候选词
 
 ## Rime 配置
@@ -161,6 +165,8 @@ PTT_KEYVAL = IBus.KEY_F9  # 修改为其他按键
     "timeout_ms": 12000,
     "min_chars": 8,
     "max_tokens": 96,
+    "edit_enabled": true,
+    "edit_max_tokens": 256,
     "enable_thinking": false
   }
 }
@@ -184,6 +190,8 @@ PTT_KEYVAL = IBus.KEY_F9  # 修改为其他按键
     "timeout_ms": 20000,
     "min_chars": 8,
     "max_tokens": 128,
+    "edit_enabled": true,
+    "edit_max_tokens": 256,
     "retry_without_proxy": true
   }
 }
@@ -195,6 +203,46 @@ PTT_KEYVAL = IBus.KEY_F9  # 修改为其他按键
 - `max_tokens`：润色输出预算
 - `enable_thinking`：是否允许思考输出（默认 `false`）
 - `retry_without_proxy`：远程请求失败时绕过代理直连重试（默认 `true`）
+- `edit_enabled`：是否启用 `Ctrl+F9` 语音编辑（默认 `true`）
+- `edit_max_tokens`：编辑模式输出预算（默认 `256`）
+
+### 语音编辑（Ctrl+F9）详解
+
+#### 触发流程
+
+1. 按下 `Ctrl+F9` 后先检测 surrounding 能力。
+2. 若不支持（`cap=0`），立即提示并结束，不启动录音。
+3. 若支持，录音并识别编辑指令。
+4. 优先执行确定性命令；未命中时交给 SLM 根据上下文完成整段编辑。
+
+#### 常用指令示例
+
+- 替换/删除：`把刚才那句话改成更正式一点`、`删除当前句`、`删除上一句`
+- 插入生成：`输入一段对海底捞商家的好评`、`输入一段关于天气的描写`
+- 导航/选择：`移动到开头`、`左移三次`、`下一个词`、`选中下一个词`、`全选`
+- 历史操作：`撤销`、`撤销修改`、`重做`
+- 诊断：`显示上下文信息`（输出 `[VT-SURR ...]`）
+
+#### 撤销与重做策略
+
+- 如果最近一次改动来自语音编辑，且文本状态匹配内部记录，执行内部撤销/重做。
+- 否则自动下发应用级快捷键：
+  - 撤销：`Ctrl+Z`
+  - 重做：`Ctrl+Shift+Z`
+
+#### 兼容性说明
+
+- 文本替换依赖 `delete_surrounding_text` 能力，状态会显示为 `del=ok/no/?`。
+- 导航命令通过 `forward_key_event` 下发；不同应用/Wayland 客户端可能有拦截差异。
+- 为避免错位编辑，录音结束执行前会校验输入框内容是否仍与快照一致；不一致会报 `输入框内容已变化，请重试`。
+
+### surrounding 探针脚本
+
+仓库提供 `scripts/test-surrounding-probe.sh`，用于快速验证不同应用中的 surrounding 抽取能力：
+
+```bash
+bash scripts/test-surrounding-probe.sh
+```
 
 ## 常见问题 (FAQ)
 

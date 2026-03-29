@@ -9,11 +9,13 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import queue
 import tempfile
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
@@ -57,6 +59,29 @@ def load_ibus_config() -> dict:
         logger.warning("加载 IBus 配置失败(%s): %s，回退默认配置", expanded_path, exc)
         return dict(DEFAULT_CONFIG)
 
+
+@dataclass
+class SurroundingSnapshot:
+    """周边文本快照（用于语音编辑）"""
+
+    text: str
+    cursor_pos: int
+    anchor_pos: int
+    selected_text: str
+
+
+@dataclass
+class DirectEditResult:
+    """结构化语音编辑命令执行结果"""
+
+    handled: bool
+    new_text: Optional[str] = None
+    record_history: bool = True
+    hint: str = ""
+    mode: str = "replace"  # replace / key_events / no_replace / commit_only
+    key_events: tuple[tuple[int, int, int], ...] = ()
+
+
 class VoCoTypeEngine(IBus.Engine):
     """VoCoType IBus语音输入引擎"""
 
@@ -67,6 +92,28 @@ class VoCoTypeEngine(IBus.Engine):
     # Linux evdev keycode for physical F9. This keeps PTT working even when
     # desktop firmware maps top-row F keys to media keyvals under Fn-lock.
     PTT_FALLBACK_KEYCODE = 67
+    # 调试探针：Ctrl+F9 读取 surrounding text 并回填
+    SURROUNDING_PROBE_CTRL_MASK = IBus.ModifierType.CONTROL_MASK
+    EDIT_HISTORY_LIMIT = 20
+    _PUNCTUATION_MAP = {
+        "句号": "。",
+        "逗号": "，",
+        "问号": "？",
+        "感叹号": "！",
+        "冒号": "：",
+        "分号": "；",
+        "引号": "“”",
+    }
+    _KEYCODE_HINTS = {
+        IBus.KEY_Left: 105,
+        IBus.KEY_Right: 106,
+        IBus.KEY_Up: 103,
+        IBus.KEY_Down: 108,
+        IBus.KEY_Home: 102,
+        IBus.KEY_End: 107,
+        IBus.KEY_a: 30,
+        IBus.KEY_z: 44,
+    }
 
     # 全局session跟踪（用于调试）
     _active_sessions = set()
@@ -87,11 +134,21 @@ class VoCoTypeEngine(IBus.Engine):
         # 状态
         self._is_recording = False
         self._recording_long_mode = False
+        self._recording_edit_mode = False
         self._audio_frames: list[np.ndarray] = []
         self._audio_queue: queue.Queue = queue.Queue(maxsize=500)
         self._stop_event = threading.Event()
         self._capture_thread: Optional[threading.Thread] = None
         self._stream = None
+        self._edit_snapshot: Optional[SurroundingSnapshot] = None
+        self._edit_undo_stack: list[str] = []
+        self._edit_redo_stack: list[str] = []
+        self._voice_clipboard = ""
+        self._engine_enabled = False
+        self._has_focus = False
+        self._replace_capability_state = "unknown"  # unknown/supported/unsupported
+        self._last_text_change_source = "none"  # none / voice_edit / app_commit
+        self._last_internal_edit_text: Optional[str] = None
 
         # 运行配置（用于长句模式）
         self._runtime_config = load_ibus_config()
@@ -107,6 +164,7 @@ class VoCoTypeEngine(IBus.Engine):
         self._rime_available = self._check_rime_available()
         self._rime_enabled = self._rime_available  # 只有 pyrime 可用时才启用
         self._rime_init_lock = threading.Lock()
+        self._client_capabilities = 0
 
         if self._rime_available:
             logger.info("VoCoTypeEngine 实例已创建（Rime 集成已启用）")
@@ -373,10 +431,23 @@ class VoCoTypeEngine(IBus.Engine):
     def do_enable(self):
         """引擎启用"""
         logger.info("Engine enabled")
+        self._engine_enabled = True
+        # 告知客户端需要 surrounding text（若客户端支持）。
+        # IBus C API 文档建议在 enable 阶段调用 get_surrounding_text。
+        try:
+            self.get_surrounding_text()
+        except Exception as exc:
+            logger.debug("enable 阶段请求 surrounding text 失败: %s", exc)
+
+    def do_set_capabilities(self, caps):
+        """记录客户端能力（用于 surrounding text 调试输出）"""
+        self._client_capabilities = int(caps)
+        logger.info("Client capabilities updated: 0x%x", self._client_capabilities)
 
     def do_disable(self):
         """引擎禁用时清理资源（IBus不会调用do_destroy）"""
         logger.info("Engine disabled")
+        self._engine_enabled = False
 
         # 停止录音
         if self._is_recording:
@@ -385,6 +456,7 @@ class VoCoTypeEngine(IBus.Engine):
         # 清除UI
         self._clear_preedit()
         self.hide_lookup_table()
+        self._edit_snapshot = None
 
         # 释放Rime session（因为IBus不会调用do_destroy）
         if self._rime_session:
@@ -438,10 +510,12 @@ class VoCoTypeEngine(IBus.Engine):
     def do_focus_in(self):
         """获得输入焦点"""
         logger.info("Engine got focus")
+        self._has_focus = True
 
     def do_focus_out(self):
         """失去输入焦点"""
         logger.info("Engine lost focus")
+        self._has_focus = False
         if self._is_recording:
             self._stop_recording()
         # 清除 Rime 组合
@@ -538,6 +612,27 @@ class VoCoTypeEngine(IBus.Engine):
 
         # 处理 F9 键：优先 keyval，其次兼容物理 keycode（Fn 锁/多媒体键场景）
         is_ptt_key = (keyval == self.PTT_KEYVAL) or (keycode == self.PTT_FALLBACK_KEYCODE)
+
+        # Ctrl+F9: 语音编辑模式
+        # Ctrl+Shift+F9: surrounding text 探针（保留调试能力）
+        disallowed_mods = IBus.ModifierType.MOD1_MASK | IBus.ModifierType.SUPER_MASK | IBus.ModifierType.MOD4_MASK
+        ctrl_held = bool(state & self.SURROUNDING_PROBE_CTRL_MASK)
+        shift_held = bool(state & IBus.ModifierType.SHIFT_MASK)
+        is_ctrl_edit = is_ptt_key and ctrl_held and not shift_held and not (state & disallowed_mods)
+        is_ctrl_probe = is_ptt_key and ctrl_held and shift_held and not (state & disallowed_mods)
+
+        if is_ctrl_edit:
+            if not is_release:
+                self._start_voice_edit_recording()
+            elif self._is_recording and self._recording_edit_mode:
+                self._stop_and_transcribe()
+            return True
+
+        if is_ctrl_probe:
+            if not is_release:
+                self._probe_surrounding_text()
+            return True
+
         if not is_ptt_key:
             if self._is_ibus_switch_hotkey(keyval, state):
                 return False
@@ -554,6 +649,737 @@ class VoCoTypeEngine(IBus.Engine):
             if self._is_recording:
                 self._stop_and_transcribe()
             return True
+
+    def _supports_surrounding_text(self) -> bool:
+        return bool(self._client_capabilities & int(IBus.Capabilite.SURROUNDING_TEXT))
+
+    def _is_engine_active(self) -> bool:
+        """是否仍是当前活跃输入法引擎（避免切换输入法后误上屏）"""
+        return bool(self._engine_enabled and self._has_focus)
+
+    def _clear_auxiliary_text(self):
+        try:
+            self.hide_auxiliary_text()
+        except Exception:
+            pass
+        return False
+
+    def _update_auxiliary_status(self, text: str):
+        try:
+            aux = IBus.Text.new_from_string(text)
+            self.update_auxiliary_text(aux, True)
+        except Exception as exc:
+            logger.debug("更新辅助状态失败: %s", exc)
+
+    def _show_nonintrusive_error(self, error: str, timeout_ms: int = 2000) -> bool:
+        self._update_auxiliary_status(f"❌ {error}")
+        GLib.timeout_add(timeout_ms, self._clear_auxiliary_text)
+        return False
+
+    def _build_edit_env_status(self, snapshot: Optional[SurroundingSnapshot]) -> str:
+        has_sur = int(self._supports_surrounding_text())
+        if self._replace_capability_state == "supported":
+            replace_flag = "del=ok"
+        elif self._replace_capability_state == "unsupported":
+            replace_flag = "del=no"
+        else:
+            replace_flag = "del=?"
+        sel_len = 0
+        if snapshot is not None:
+            sel_len = max(0, abs(int(snapshot.cursor_pos) - int(snapshot.anchor_pos)))
+        active = int(self._is_engine_active())
+        return f"🎤 编辑中({replace_flag} sur={has_sur} sel={sel_len} active={active})"
+
+    def _capture_surrounding_snapshot(self) -> tuple[Optional[SurroundingSnapshot], str]:
+        if not self._supports_surrounding_text():
+            return None, "当前输入框不支持获取输入内容"
+
+        try:
+            ibus_text, cursor_pos, anchor_pos = self.get_surrounding_text()
+            surrounding = ibus_text.get_text() if ibus_text else ""
+        except Exception as exc:
+            logger.warning("读取 surrounding text 失败: %s", exc)
+            return None, "当前输入框不支持获取输入内容"
+
+        text_len = len(surrounding)
+        cursor = max(0, min(int(cursor_pos), text_len))
+        anchor = max(0, min(int(anchor_pos), text_len))
+
+        selected = ""
+        if anchor != cursor:
+            sel_start, sel_end = sorted((anchor, cursor))
+            selected = surrounding[sel_start:sel_end]
+
+        return (
+            SurroundingSnapshot(
+                text=surrounding,
+                cursor_pos=cursor,
+                anchor_pos=anchor,
+                selected_text=selected,
+            ),
+            "",
+        )
+
+    def _start_voice_edit_recording(self):
+        """Ctrl+F9: 开始语音编辑（先验证 surrounding 能力）"""
+        if self._is_recording:
+            return
+
+        if not self._is_engine_active():
+            self._show_nonintrusive_error("当前输入法未激活，已取消编辑")
+            return
+
+        if not self._slm_polisher.enabled:
+            self._show_nonintrusive_error("SLM 未启用，无法语音编辑")
+            return
+
+        snapshot, error = self._capture_surrounding_snapshot()
+        if snapshot is None:
+            self._show_nonintrusive_error(error or "当前输入框不支持获取输入内容")
+            return
+
+        self._edit_snapshot = snapshot
+        self._start_recording(edit_mode=True)
+
+    def _show_hint(self, text: str, timeout_ms: int = 1600) -> bool:
+        """短暂显示提示，不改写输入框正文"""
+        self._update_auxiliary_status(text)
+        GLib.timeout_add(timeout_ms, self._clear_auxiliary_text)
+        return False
+
+    @staticmethod
+    def _parse_count_from_command(cmd: str) -> int:
+        """从命令中解析重复次数，默认 1，最大 20。"""
+        digit_match = re.search(r"(\d+)", cmd)
+        if digit_match:
+            return max(1, min(20, int(digit_match.group(1))))
+
+        cn_map = {
+            "一": 1,
+            "二": 2,
+            "两": 2,
+            "三": 3,
+            "四": 4,
+            "五": 5,
+            "六": 6,
+            "七": 7,
+            "八": 8,
+            "九": 9,
+            "十": 10,
+        }
+        for ch, value in cn_map.items():
+            if ch in cmd:
+                return value
+        return 1
+
+    @staticmethod
+    def _normalize_voice_command(command: str) -> str:
+        cmd = " ".join((command or "").strip().split())
+        if not cmd:
+            return ""
+        cmd = re.sub(r"^(?:请|麻烦|帮我|帮忙)\s*", "", cmd)
+        cmd = re.sub(r"(一下子?|吧)$", "", cmd)
+        cmd = re.sub(r"[。！？!?，,；;：:]+$", "", cmd)
+        return cmd.strip()
+
+    def _rewrite_insert_generation_instruction(self, command: str) -> str:
+        """将“输入/写一段/生成一段 ...”重写为可执行的编辑指令。"""
+        cmd = self._normalize_voice_command(command)
+        if not cmd:
+            return ""
+
+        match = re.match(
+            r"^(?:输入|写|写一段|生成|生成一段|来一段)\s*(.+)\s*$",
+            cmd,
+        )
+        if not match:
+            return ""
+
+        request = self._strip_command_quotes(match.group(1))
+        if not request:
+            return ""
+
+        return (
+            "请按以下要求生成并插入文本："
+            f"{request}。"
+            "将生成结果插入到当前光标位置；如果当前有选中文本，则替换选中内容。"
+            "除插入/替换位置外，不要改动任何其他文本。"
+            "只输出编辑后的完整输入框文本。"
+        )
+
+    def _keycode_for_keyval(self, keyval: int) -> int:
+        return int(self._KEYCODE_HINTS.get(int(keyval), 0))
+
+    def _key_events(
+        self,
+        keyval: int,
+        *,
+        state: int = 0,
+        repeat: int = 1,
+        keycode: Optional[int] = None,
+    ) -> tuple[tuple[int, int, int], ...]:
+        events: list[tuple[int, int, int]] = []
+        count = max(1, min(20, int(repeat)))
+        resolved_keycode = self._keycode_for_keyval(keyval) if keycode is None else int(keycode)
+        for _ in range(count):
+            events.append((int(keyval), resolved_keycode, int(state)))
+        return tuple(events)
+
+    def _run_key_events(self, events: tuple[tuple[int, int, int], ...], hint: str = "") -> bool:
+        """在主线程执行导航/选区按键序列。"""
+        if not self._is_engine_active():
+            self._show_nonintrusive_error("当前输入法未激活，已取消导航")
+            return False
+
+        if not events:
+            if hint:
+                self._show_hint(hint)
+            return False
+
+        try:
+            release_mask = int(IBus.ModifierType.RELEASE_MASK)
+            logger.info("执行导航按键序列: %s", events)
+            for keyval, keycode, state in events:
+                pressed_state = int(state)
+                self.forward_key_event(int(keyval), int(keycode), pressed_state)
+                self.forward_key_event(int(keyval), int(keycode), pressed_state | release_mask)
+            if hint:
+                self._show_hint(hint)
+            return False
+        except Exception as exc:
+            logger.warning("导航按键下发失败: %s", exc)
+            self._show_nonintrusive_error("当前输入框不支持导航命令")
+            return False
+
+    def _push_undo_state(self, text: str) -> None:
+        if self._edit_undo_stack and self._edit_undo_stack[-1] == text:
+            return
+        self._edit_undo_stack.append(text)
+        if len(self._edit_undo_stack) > self.EDIT_HISTORY_LIMIT:
+            self._edit_undo_stack.pop(0)
+        self._edit_redo_stack.clear()
+
+    @staticmethod
+    def _strip_command_quotes(text: str) -> str:
+        return str(text or "").strip().strip("“”\"'")
+
+    @staticmethod
+    def _predict_commit_result(snapshot: SurroundingSnapshot, payload: str) -> str:
+        """预测 commit_text 后的 surrounding 文本（用于撤销分流判断）。"""
+        text = snapshot.text or ""
+        cursor = max(0, min(int(snapshot.cursor_pos), len(text)))
+        anchor = max(0, min(int(snapshot.anchor_pos), len(text)))
+        sel_start, sel_end = sorted((anchor, cursor))
+        if sel_end > sel_start:
+            return text[:sel_start] + payload + text[sel_end:]
+        return text[:cursor] + payload + text[cursor:]
+
+    @staticmethod
+    def _sentence_spans(text: str) -> list[tuple[int, int]]:
+        if not text:
+            return []
+        delimiters = set("。！？!?；;.\n")
+        spans: list[tuple[int, int]] = []
+        start = 0
+        for idx, ch in enumerate(text):
+            if ch in delimiters:
+                end = idx + 1
+                if end > start:
+                    spans.append((start, end))
+                start = end
+        if start < len(text):
+            spans.append((start, len(text)))
+        return spans
+
+    @staticmethod
+    def _locate_sentence_index(spans: list[tuple[int, int]], cursor_pos: int) -> int:
+        if not spans:
+            return -1
+        cursor = max(0, cursor_pos)
+        for idx, (seg_start, seg_end) in enumerate(spans):
+            if seg_start <= cursor <= seg_end:
+                return idx
+        return len(spans) - 1
+
+    def _apply_direct_edit_command(
+        self,
+        snapshot: SurroundingSnapshot,
+        instruction: str,
+    ) -> DirectEditResult:
+        """优先处理高频、确定性语音编辑命令。"""
+        cmd = self._normalize_voice_command(instruction)
+        if not cmd:
+            return DirectEditResult(False)
+
+        text = snapshot.text
+        cursor = snapshot.cursor_pos
+        anchor = snapshot.anchor_pos
+        lower_cmd = cmd.lower()
+
+        if lower_cmd in {
+            "显示上下文",
+            "显示上下文信息",
+            "输出上下文",
+            "输出上下文信息",
+            "显示surrounding信息",
+            "输出surrounding信息",
+            "surrounding info",
+            "context info",
+        }:
+            current_sentence, previous_sentence = self._extract_sentence_window(text, cursor)
+            report = (
+                "[VT-SURR "
+                f"cap={int(self._supports_surrounding_text())} "
+                f"active={int(self._is_engine_active())} "
+                f"del={self._replace_capability_state} "
+                f"len={len(text)} cursor={cursor} anchor={anchor} "
+                f"prev='{self._clip_probe_text(previous_sentence)}' "
+                f"cur='{self._clip_probe_text(current_sentence)}' "
+                f"sel='{self._clip_probe_text(snapshot.selected_text)}' "
+                f"all='{self._clip_probe_text(text, 120)}'"
+                "]"
+            )
+            return DirectEditResult(
+                handled=True,
+                mode="commit_only",
+                new_text=report,
+                record_history=True,
+                hint="已输出上下文信息",
+            )
+
+        sel_start, sel_end = sorted((anchor, cursor))
+        selected_text = text[sel_start:sel_end] if sel_end > sel_start else ""
+
+        if lower_cmd in {"撤销", "撤回", "撤销修改", "撤销上一步", "undo"}:
+            can_internal_undo = (
+                bool(self._edit_undo_stack)
+                and self._last_text_change_source == "voice_edit"
+                and self._last_internal_edit_text == text
+            )
+            if can_internal_undo:
+                previous = self._edit_undo_stack.pop()
+                self._edit_redo_stack.append(text)
+                if len(self._edit_redo_stack) > self.EDIT_HISTORY_LIMIT:
+                    self._edit_redo_stack.pop(0)
+                return DirectEditResult(True, previous, record_history=False, hint="已撤销语音编辑")
+
+            self._last_text_change_source = "app_commit"
+            self._last_internal_edit_text = None
+            return DirectEditResult(
+                handled=True,
+                mode="key_events",
+                key_events=self._key_events(
+                    IBus.KEY_z,
+                    state=int(IBus.ModifierType.CONTROL_MASK),
+                ),
+                record_history=False,
+                hint="已发送应用撤销",
+            )
+
+        if lower_cmd in {"重做", "恢复", "redo"}:
+            can_internal_redo = (
+                bool(self._edit_redo_stack)
+                and self._last_text_change_source == "voice_edit"
+                and self._last_internal_edit_text == text
+            )
+            if can_internal_redo:
+                recovered = self._edit_redo_stack.pop()
+                self._edit_undo_stack.append(text)
+                if len(self._edit_undo_stack) > self.EDIT_HISTORY_LIMIT:
+                    self._edit_undo_stack.pop(0)
+                return DirectEditResult(True, recovered, record_history=False, hint="已重做语音编辑")
+
+            self._last_text_change_source = "app_commit"
+            self._last_internal_edit_text = None
+            return DirectEditResult(
+                handled=True,
+                mode="key_events",
+                key_events=self._key_events(
+                    IBus.KEY_z,
+                    state=int(IBus.ModifierType.CONTROL_MASK | IBus.ModifierType.SHIFT_MASK),
+                ),
+                record_history=False,
+                hint="已发送应用重做",
+            )
+
+        if lower_cmd in {"复制全部", "复制全文", "copy all"}:
+            self._voice_clipboard = text
+            return DirectEditResult(True, text, record_history=False, hint="已复制全文")
+
+        if lower_cmd in {"复制选中", "复制选中内容", "copy that"}:
+            if not selected_text:
+                return DirectEditResult(True, text, record_history=False, hint="当前没有选中内容")
+            self._voice_clipboard = selected_text
+            return DirectEditResult(True, text, record_history=False, hint="已复制选中内容")
+
+        if lower_cmd in {"剪切全部", "剪切全文", "cut all"}:
+            self._voice_clipboard = text
+            return DirectEditResult(True, "", record_history=True, hint="已剪切全文")
+
+        if lower_cmd in {"剪切选中", "剪切选中内容", "cut that"}:
+            if not selected_text:
+                return DirectEditResult(True, text, record_history=False, hint="当前没有选中内容")
+            self._voice_clipboard = selected_text
+            return DirectEditResult(
+                True,
+                text[:sel_start] + text[sel_end:],
+                record_history=True,
+                hint="已剪切选中内容",
+            )
+
+        if lower_cmd in {"粘贴", "贴上", "paste"}:
+            if not self._voice_clipboard:
+                return DirectEditResult(True, text, record_history=False, hint="剪贴板为空")
+            if sel_end > sel_start:
+                merged = text[:sel_start] + self._voice_clipboard + text[sel_end:]
+            else:
+                merged = text[:cursor] + self._voice_clipboard + text[cursor:]
+            return DirectEditResult(True, merged, record_history=True, hint="已粘贴")
+
+        if lower_cmd in {"清空", "清空输入框", "删除全部", "删掉全部", "全选删除"}:
+            return DirectEditResult(True, "", record_history=True, hint="已清空")
+
+        if lower_cmd in {"删除选中", "删除选中内容"}:
+            if not selected_text:
+                return DirectEditResult(True, text, record_history=False, hint="当前没有选中内容")
+            return DirectEditResult(
+                True,
+                text[:sel_start] + text[sel_end:],
+                record_history=True,
+                hint="已删除选中内容",
+            )
+
+        if lower_cmd in {"删除当前句", "删掉当前句"}:
+            spans = self._sentence_spans(text)
+            idx = self._locate_sentence_index(spans, cursor)
+            if idx < 0:
+                return DirectEditResult(True, text, record_history=False, hint="未找到当前句")
+            start, end = spans[idx]
+            return DirectEditResult(True, text[:start] + text[end:], record_history=True, hint="已删除当前句")
+
+        if lower_cmd in {"删除上一句", "删掉上一句"}:
+            spans = self._sentence_spans(text)
+            idx = self._locate_sentence_index(spans, cursor)
+            if idx <= 0:
+                return DirectEditResult(True, text, record_history=False, hint="没有上一句可删除")
+            start, end = spans[idx - 1]
+            return DirectEditResult(True, text[:start] + text[end:], record_history=True, hint="已删除上一句")
+
+        replace_match = re.match(
+            r"^(?:把|将)\s*(.+?)\s*(?:改成|改为|替换成|替换为)\s*(.+)\s*$",
+            cmd,
+        )
+        if replace_match:
+            old = self._strip_command_quotes(replace_match.group(1))
+            new = self._strip_command_quotes(replace_match.group(2))
+            if not old:
+                return DirectEditResult(True, text, record_history=False, hint="替换目标为空")
+            if old not in text:
+                return DirectEditResult(True, text, record_history=False, hint=f"未找到“{old}”")
+            return DirectEditResult(
+                True,
+                text.replace(old, new, 1),
+                record_history=True,
+                hint="已替换",
+            )
+
+        insert_before_match = re.match(r"^在\s*(.+?)\s*(?:前面|前)\s*插入\s*(.+)\s*$", cmd)
+        if insert_before_match:
+            marker = self._strip_command_quotes(insert_before_match.group(1))
+            payload = self._strip_command_quotes(insert_before_match.group(2))
+            idx = text.find(marker)
+            if idx < 0:
+                return DirectEditResult(True, text, record_history=False, hint=f"未找到“{marker}”")
+            return DirectEditResult(True, text[:idx] + payload + text[idx:], record_history=True, hint="已插入")
+
+        insert_after_match = re.match(r"^在\s*(.+?)\s*(?:后面|后)\s*插入\s*(.+)\s*$", cmd)
+        if insert_after_match:
+            marker = self._strip_command_quotes(insert_after_match.group(1))
+            payload = self._strip_command_quotes(insert_after_match.group(2))
+            idx = text.find(marker)
+            if idx < 0:
+                return DirectEditResult(True, text, record_history=False, hint=f"未找到“{marker}”")
+            end = idx + len(marker)
+            return DirectEditResult(True, text[:end] + payload + text[end:], record_history=True, hint="已插入")
+
+        prepend_match = re.match(r"^(?:在)?(?:开头|最前面)(?:插入|添加|加上)\s*(.+)\s*$", cmd)
+        if prepend_match:
+            payload = self._strip_command_quotes(prepend_match.group(1))
+            return DirectEditResult(True, payload + text, record_history=True, hint="已在开头插入")
+
+        append_match = re.match(r"^(?:在)?(?:结尾|末尾|最后)(?:插入|添加|加上|追加)\s*(.+)\s*$", cmd)
+        if append_match:
+            payload = self._strip_command_quotes(append_match.group(1))
+            return DirectEditResult(True, text + payload, record_history=True, hint="已在结尾插入")
+
+        append_simple_match = re.match(r"^(?:追加|添加|加上)\s*(.+)\s*$", cmd)
+        if append_simple_match:
+            payload = self._strip_command_quotes(append_simple_match.group(1))
+            return DirectEditResult(True, text + payload, record_history=True, hint="已追加")
+
+        punct_match = re.match(r"^(?:加|插入)\s*(句号|逗号|问号|感叹号|冒号|分号|引号)\s*$", cmd)
+        if punct_match:
+            punct = self._PUNCTUATION_MAP.get(punct_match.group(1), "")
+            if punct:
+                return DirectEditResult(True, text + punct, record_history=True, hint="已添加标点")
+
+        if lower_cmd in {"全部大写", "全大写", "uppercase"}:
+            return DirectEditResult(True, text.upper(), record_history=True, hint="已转为大写")
+        if lower_cmd in {"全部小写", "全小写", "lowercase"}:
+            return DirectEditResult(True, text.lower(), record_history=True, hint="已转为小写")
+        if lower_cmd in {"首字母大写", "标题格式", "title case"}:
+            return DirectEditResult(True, text.title(), record_history=True, hint="已转为首字母大写")
+        if lower_cmd in {"加粗", "加粗选中", "bold", "bold that"}:
+            if sel_end > sel_start:
+                styled = text[:sel_start] + f"**{selected_text}**" + text[sel_end:]
+            else:
+                styled = f"**{text}**"
+            return DirectEditResult(True, styled, record_history=True, hint="已加粗")
+        if lower_cmd in {"斜体", "斜体选中", "italic", "italicize"}:
+            if sel_end > sel_start:
+                styled = text[:sel_start] + f"*{selected_text}*" + text[sel_end:]
+            else:
+                styled = f"*{text}*"
+            return DirectEditResult(True, styled, record_history=True, hint="已设为斜体")
+
+        delete_match = re.match(r"^(?:删除|删掉|去掉)\s*(.+)\s*$", cmd)
+        if delete_match:
+            target = self._strip_command_quotes(delete_match.group(1))
+            if target in {"当前句", "上一句", "全部", "选中内容", "选中"}:
+                return DirectEditResult(False)
+            if target and target in text:
+                return DirectEditResult(
+                    True,
+                    text.replace(target, "", 1),
+                    record_history=True,
+                    hint="已删除",
+                )
+            return DirectEditResult(True, text, record_history=False, hint=f"未找到“{target}”")
+
+        count = self._parse_count_from_command(cmd)
+        if lower_cmd in {"全选", "选中全部", "select all"}:
+            return DirectEditResult(
+                handled=True,
+                mode="key_events",
+                key_events=self._key_events(
+                    IBus.KEY_a,
+                    state=int(IBus.ModifierType.CONTROL_MASK),
+                ),
+                record_history=False,
+                hint="已全选",
+            )
+
+        if lower_cmd in {"移动到开头", "跳到开头", "到开头", "行首", "到行首", "移动到行首"}:
+            return DirectEditResult(
+                handled=True,
+                mode="key_events",
+                key_events=self._key_events(IBus.KEY_Home),
+                record_history=False,
+                hint="已移动到开头",
+            )
+        if lower_cmd in {"移动到结尾", "跳到结尾", "到结尾", "行尾", "到行尾", "移动到行尾"}:
+            return DirectEditResult(
+                handled=True,
+                mode="key_events",
+                key_events=self._key_events(IBus.KEY_End),
+                record_history=False,
+                hint="已移动到结尾",
+            )
+        if lower_cmd in {"段首", "到段首", "移动到段首"}:
+            return DirectEditResult(
+                handled=True,
+                mode="key_events",
+                key_events=self._key_events(
+                    IBus.KEY_Up,
+                    state=int(IBus.ModifierType.CONTROL_MASK),
+                ),
+                record_history=False,
+                hint="已尝试移动到段首",
+            )
+        if lower_cmd in {"段尾", "到段尾", "移动到段尾"}:
+            return DirectEditResult(
+                handled=True,
+                mode="key_events",
+                key_events=self._key_events(
+                    IBus.KEY_Down,
+                    state=int(IBus.ModifierType.CONTROL_MASK),
+                ),
+                record_history=False,
+                hint="已尝试移动到段尾",
+            )
+
+        if re.match(r"^(?:向|往)?左(?:移|移动)?(?:\s*\d+|\s*[一二两三四五六七八九十])?(?:次|个字|个字符)?$", cmd) or lower_cmd in {"左移", "向左"}:
+            return DirectEditResult(
+                handled=True,
+                mode="key_events",
+                key_events=self._key_events(IBus.KEY_Left, repeat=count),
+                record_history=False,
+                hint=f"已左移{count}次",
+            )
+        if re.match(r"^(?:向|往)?右(?:移|移动)?(?:\s*\d+|\s*[一二两三四五六七八九十])?(?:次|个字|个字符)?$", cmd) or lower_cmd in {"右移", "向右"}:
+            return DirectEditResult(
+                handled=True,
+                mode="key_events",
+                key_events=self._key_events(IBus.KEY_Right, repeat=count),
+                record_history=False,
+                hint=f"已右移{count}次",
+            )
+
+        if lower_cmd in {"下一个词", "到下一个词", "移动到下一个词", "next word"}:
+            return DirectEditResult(
+                handled=True,
+                mode="key_events",
+                key_events=self._key_events(
+                    IBus.KEY_Right,
+                    state=int(IBus.ModifierType.CONTROL_MASK),
+                    repeat=count,
+                ),
+                record_history=False,
+                hint="已移动到下一个词",
+            )
+        if lower_cmd in {"上一个词", "到上一个词", "移动到上一个词", "previous word"}:
+            return DirectEditResult(
+                handled=True,
+                mode="key_events",
+                key_events=self._key_events(
+                    IBus.KEY_Left,
+                    state=int(IBus.ModifierType.CONTROL_MASK),
+                    repeat=count,
+                ),
+                record_history=False,
+                hint="已移动到上一个词",
+            )
+
+        if lower_cmd in {"选中下一个词", "选择下一个词"}:
+            return DirectEditResult(
+                handled=True,
+                mode="key_events",
+                key_events=self._key_events(
+                    IBus.KEY_Right,
+                    state=int(IBus.ModifierType.CONTROL_MASK | IBus.ModifierType.SHIFT_MASK),
+                    repeat=count,
+                ),
+                record_history=False,
+                hint="已尝试选中下一个词",
+            )
+        if lower_cmd in {"选中上一个词", "选择上一个词"}:
+            return DirectEditResult(
+                handled=True,
+                mode="key_events",
+                key_events=self._key_events(
+                    IBus.KEY_Left,
+                    state=int(IBus.ModifierType.CONTROL_MASK | IBus.ModifierType.SHIFT_MASK),
+                    repeat=count,
+                ),
+                record_history=False,
+                hint="已尝试选中上一个词",
+            )
+
+        return DirectEditResult(False)
+
+    def _replace_surrounding_text(
+        self,
+        new_text: str,
+        original_text: str,
+        cursor_pos: int,
+        record_history: bool = True,
+        hint: str = "",
+    ) -> bool:
+        """用新文本替换当前 surrounding 区域"""
+        try:
+            if not self._is_engine_active():
+                self._show_nonintrusive_error("当前输入法未激活，已取消上屏")
+                return False
+
+            # 防止录音期间用户继续编辑导致替换错位。
+            live_text_obj, live_cursor, _ = self.get_surrounding_text()
+            live_text = live_text_obj.get_text() if live_text_obj else ""
+            if live_text != original_text or int(live_cursor) != int(cursor_pos):
+                self._show_nonintrusive_error("输入框内容已变化，请重试")
+                return False
+
+            if new_text == original_text:
+                if hint:
+                    self._show_hint(hint)
+                else:
+                    self._clear_preedit()
+                return False
+
+            original_len = len(original_text)
+            safe_cursor = max(0, min(int(cursor_pos), int(original_len)))
+            safe_len = max(0, int(original_len))
+            self.delete_surrounding_text(-safe_cursor, safe_len)
+            GLib.timeout_add(
+                40,
+                self._finalize_surrounding_replace,
+                new_text,
+                original_text,
+                int(cursor_pos),
+                int(record_history),
+                hint,
+                4,
+            )
+            return False
+        except Exception as exc:
+            logger.warning("替换 surrounding text 失败: %s", exc)
+            self._replace_capability_state = "unsupported"
+            self._show_nonintrusive_error("当前输入框不支持替换文本")
+            return False
+
+    def _finalize_surrounding_replace(
+        self,
+        new_text: str,
+        original_text: str,
+        cursor_pos: int,
+        record_history_int: int,
+        hint: str,
+        retries_left: int,
+    ) -> bool:
+        """删除后确认文本确实发生变化，再提交新文本，避免“删除失败 + 重复插入”"""
+        try:
+            if not self._is_engine_active():
+                self._show_nonintrusive_error("当前输入法未激活，已取消上屏")
+                return False
+
+            live_text_obj, live_cursor, _ = self.get_surrounding_text()
+            live_text = live_text_obj.get_text() if live_text_obj else ""
+            unchanged = (
+                original_text
+                and live_text == original_text
+                and int(live_cursor) == int(cursor_pos)
+            )
+
+            if unchanged and retries_left > 0:
+                GLib.timeout_add(
+                    40,
+                    self._finalize_surrounding_replace,
+                    new_text,
+                    original_text,
+                    int(cursor_pos),
+                    int(record_history_int),
+                    hint,
+                    int(retries_left - 1),
+                )
+                return False
+
+            if unchanged:
+                self._replace_capability_state = "unsupported"
+                self._show_nonintrusive_error("当前输入框不支持替换文本")
+                return False
+
+            self._replace_capability_state = "supported"
+            if bool(record_history_int):
+                self._push_undo_state(original_text)
+            self._last_internal_edit_text = new_text
+            self._commit_text(new_text, "voice_edit")
+            if hint:
+                GLib.timeout_add(30, self._show_hint, hint, 1200)
+            return False
+        except Exception as exc:
+            logger.warning("确认替换结果失败: %s", exc)
+            self._replace_capability_state = "unsupported"
+            self._show_nonintrusive_error("当前输入框不支持替换文本")
+            return False
 
     def _forward_key_to_rime(self, keyval, keycode, state) -> bool:
         """将按键事件转发给 Rime（使用 pyrime）"""
@@ -677,7 +1503,7 @@ class VoCoTypeEngine(IBus.Engine):
             return True
         return False
 
-    def _start_recording(self, long_mode: bool = False):
+    def _start_recording(self, long_mode: bool = False, edit_mode: bool = False):
         """开始录音"""
         if self._is_recording:
             return
@@ -687,6 +1513,7 @@ class VoCoTypeEngine(IBus.Engine):
 
             self._is_recording = True
             self._recording_long_mode = long_mode
+            self._recording_edit_mode = edit_mode
             self._audio_frames.clear()
             self._stop_event.clear()
 
@@ -734,13 +1561,23 @@ class VoCoTypeEngine(IBus.Engine):
             self._capture_thread.start()
 
             # 显示录音状态
-            if long_mode:
+            if edit_mode:
+                self._update_auxiliary_status(self._build_edit_env_status(self._edit_snapshot))
+                # 编辑模式也可能调用本地 SLM，录音期间预热减少松键后等待。
+                self._slm_polisher.prewarm(long_mode=True)
+            elif long_mode:
                 self._update_preedit("🎤 录音中(长句)...")
                 # 录音期间并行预加载本地一次性 SLM，减少松键后的等待时间
                 self._slm_polisher.prewarm(long_mode=True)
             else:
                 self._update_preedit("🎤 录音中...")
-            logger.info("开始录音 mode=%s", "long" if long_mode else "normal")
+            if edit_mode:
+                mode_name = "edit"
+            elif long_mode:
+                mode_name = "long"
+            else:
+                mode_name = "normal"
+            logger.info("开始录音 mode=%s", mode_name)
 
             # 确保ASR已初始化
             self._ensure_asr_ready()
@@ -749,6 +1586,7 @@ class VoCoTypeEngine(IBus.Engine):
             logger.error(f"启动录音失败: {e}")
             self._is_recording = False
             self._recording_long_mode = False
+            self._recording_edit_mode = False
             self._update_preedit(f"❌ 录音失败: {e}")
             GLib.timeout_add(2000, self._clear_preedit)
 
@@ -758,6 +1596,7 @@ class VoCoTypeEngine(IBus.Engine):
             return
 
         long_mode = self._recording_long_mode
+        edit_mode = self._recording_edit_mode
         self._stop_event.set()
 
         if self._stream:
@@ -774,9 +1613,12 @@ class VoCoTypeEngine(IBus.Engine):
 
         self._is_recording = False
         self._recording_long_mode = False
+        self._recording_edit_mode = False
         self._clear_preedit()
-        if long_mode:
+        if long_mode or edit_mode:
             self._slm_polisher.release()
+        if edit_mode:
+            self._edit_snapshot = None
         logger.info("录音已停止")
 
     def _stop_and_transcribe(self):
@@ -785,6 +1627,8 @@ class VoCoTypeEngine(IBus.Engine):
             return
 
         long_mode = self._recording_long_mode
+        edit_mode = self._recording_edit_mode
+        edit_snapshot = self._edit_snapshot if edit_mode else None
 
         # 停止录音
         self._stop_event.set()
@@ -803,11 +1647,20 @@ class VoCoTypeEngine(IBus.Engine):
 
         self._is_recording = False
         self._recording_long_mode = False
+        self._recording_edit_mode = False
+        self._edit_snapshot = None
+
+        if edit_mode and not self._is_engine_active():
+            self._clear_preedit()
+            self._show_nonintrusive_error("当前输入法已非活动状态，已取消编辑")
+            if long_mode or edit_mode:
+                self._slm_polisher.release()
+            return
 
         # 检查是否有音频数据
         if not self._audio_frames:
             self._clear_preedit()
-            if long_mode:
+            if long_mode or edit_mode:
                 self._slm_polisher.release()
             return
 
@@ -816,17 +1669,25 @@ class VoCoTypeEngine(IBus.Engine):
         self._audio_frames.clear()
 
         duration = len(audio_data) / self._native_sample_rate
-        logger.info("录音完成，时长: %.2f秒, mode=%s", duration, "long" if long_mode else "normal")
+        if edit_mode:
+            mode_name = "edit"
+        elif long_mode:
+            mode_name = "long"
+        else:
+            mode_name = "normal"
+        logger.info("录音完成，时长: %.2f秒, mode=%s", duration, mode_name)
 
         # 检查是否太短
         if duration < 0.3:
             self._clear_preedit()
-            if long_mode:
+            if long_mode or edit_mode:
                 self._slm_polisher.release()
             return
 
         # 显示识别中状态
-        if long_mode:
+        if edit_mode:
+            self._update_auxiliary_status("⏳ 识别编辑指令中...")
+        elif long_mode:
             self._update_preedit("⏳ 识别+润色中...")
         else:
             self._update_preedit("⏳ 识别中...")
@@ -873,6 +1734,108 @@ class VoCoTypeEngine(IBus.Engine):
                             slm_ms = 0.0
                             slm_reason = "not_used"
                             slm_used = False
+
+                            if edit_mode:
+                                if edit_snapshot is None:
+                                    logger.warning("编辑模式缺少上下文快照")
+                                    GLib.idle_add(self._show_nonintrusive_error, "编辑上下文获取失败，请重试")
+                                    return
+
+                                rewritten_instruction = self._rewrite_insert_generation_instruction(text)
+                                direct_result = self._apply_direct_edit_command(edit_snapshot, text)
+                                if direct_result.handled:
+                                    if direct_result.mode == "key_events":
+                                        GLib.idle_add(
+                                            self._run_key_events,
+                                            direct_result.key_events,
+                                            direct_result.hint,
+                                        )
+                                    elif direct_result.mode == "commit_only":
+                                        if direct_result.record_history:
+                                            self._push_undo_state(edit_snapshot.text)
+                                        if direct_result.new_text:
+                                            self._last_internal_edit_text = self._predict_commit_result(
+                                                edit_snapshot,
+                                                direct_result.new_text,
+                                            )
+                                            GLib.idle_add(
+                                                self._commit_text,
+                                                direct_result.new_text,
+                                                "voice_edit",
+                                            )
+                                        if direct_result.hint:
+                                            GLib.idle_add(self._show_hint, direct_result.hint, 1200)
+                                    elif direct_result.mode == "no_replace":
+                                        GLib.idle_add(self._show_hint, direct_result.hint, 1200)
+                                    else:
+                                        target_text = (
+                                            edit_snapshot.text
+                                            if direct_result.new_text is None
+                                            else direct_result.new_text
+                                        )
+                                        GLib.idle_add(
+                                            self._replace_surrounding_text,
+                                            target_text,
+                                            edit_snapshot.text,
+                                            edit_snapshot.cursor_pos,
+                                            direct_result.record_history,
+                                            direct_result.hint,
+                                        )
+                                    logger.info(
+                                        "编辑模式命中确定性命令: instruction=%s mode=%s hint=%s",
+                                        text,
+                                        direct_result.mode,
+                                        direct_result.hint,
+                                    )
+                                    return
+
+                                GLib.idle_add(self._update_auxiliary_status, "✍️ 正在编辑...")
+                                slm_instruction = rewritten_instruction or text
+                                if rewritten_instruction:
+                                    logger.info(
+                                        "编辑模式命中输入生成指令: instruction=%s rewritten=%s",
+                                        text,
+                                        slm_instruction,
+                                    )
+                                edited_text, metrics = self._slm_polisher.edit_with_instruction(
+                                    context_text=edit_snapshot.text,
+                                    instruction=slm_instruction,
+                                    cursor_pos=edit_snapshot.cursor_pos,
+                                    anchor_pos=edit_snapshot.anchor_pos,
+                                    selected_text=edit_snapshot.selected_text,
+                                )
+                                slm_ms = metrics.latency_ms
+                                slm_reason = metrics.reason
+                                slm_used = metrics.used
+
+                                if self._slm_polisher.is_failure_reason(metrics.reason):
+                                    logger.warning(
+                                        "编辑模式 SLM 调用失败: reason=%s",
+                                        metrics.reason,
+                                    )
+                                    GLib.idle_add(
+                                        self._show_nonintrusive_error,
+                                        self._slm_polisher.format_failure_message(metrics.reason),
+                                    )
+                                    return
+
+                                logger.info(
+                                    "转录流水线 mode=%s asr_ms=%.2f slm_used=%s slm_ms=%.2f fallback_reason=%s",
+                                    "edit",
+                                    asr_ms,
+                                    slm_used,
+                                    slm_ms,
+                                    slm_reason,
+                                )
+                                GLib.idle_add(
+                                    self._replace_surrounding_text,
+                                    edited_text,
+                                    edit_snapshot.text,
+                                    edit_snapshot.cursor_pos,
+                                    True,
+                                    "",
+                                )
+                                return
 
                             if long_mode:
                                 should_polish = self._slm_polisher.should_polish(
@@ -928,7 +1891,7 @@ class VoCoTypeEngine(IBus.Engine):
                         else:
                             logger.info(
                                 "转录流水线 mode=%s asr_ms=%.2f slm_used=false slm_ms=0.00 fallback_reason=empty_asr_text",
-                                "long" if long_mode else "normal",
+                                "edit" if edit_mode else ("long" if long_mode else "normal"),
                                 asr_ms,
                             )
                             GLib.idle_add(self._clear_preedit)
@@ -941,7 +1904,7 @@ class VoCoTypeEngine(IBus.Engine):
                         os.unlink(temp_path)
                     except:
                         pass
-                    if long_mode:
+                    if long_mode or edit_mode:
                         self._slm_polisher.release()
 
             except Exception as e:
@@ -955,15 +1918,101 @@ class VoCoTypeEngine(IBus.Engine):
         preedit = IBus.Text.new_from_string(text)
         self.update_preedit_text(preedit, len(text), True)
 
+    @staticmethod
+    def _clip_probe_text(text: str, limit: int = 48) -> str:
+        """裁剪并清洗 probe 输出，避免回填文本过长"""
+        cleaned = (text or "").replace("\n", "⏎").replace("\t", "⇥")
+        cleaned = " ".join(cleaned.split())
+        if len(cleaned) <= limit:
+            return cleaned
+        return f"{cleaned[:limit]}..."
+
+    @staticmethod
+    def _extract_sentence_window(text: str, cursor_pos: int) -> tuple[str, str]:
+        """提取当前句与上一句（宽松规则，面向调试）"""
+        if not text:
+            return "", ""
+
+        delimiters = set("。！？!?；;.\n")
+        spans: list[tuple[int, int]] = []
+        start = 0
+        for idx, ch in enumerate(text):
+            if ch in delimiters:
+                end = idx + 1
+                if end > start:
+                    spans.append((start, end))
+                start = end
+        if start < len(text):
+            spans.append((start, len(text)))
+        if not spans:
+            return text.strip(), ""
+
+        cursor = max(0, min(cursor_pos, len(text)))
+        current_idx = len(spans) - 1
+        for i, (seg_start, seg_end) in enumerate(spans):
+            if seg_start <= cursor <= seg_end:
+                current_idx = i
+                break
+
+        cur_start, cur_end = spans[current_idx]
+        current_sentence = text[cur_start:cur_end].strip()
+
+        previous_sentence = ""
+        if current_idx > 0:
+            prev_start, prev_end = spans[current_idx - 1]
+            previous_sentence = text[prev_start:prev_end].strip()
+
+        return current_sentence, previous_sentence
+
+    def _probe_surrounding_text(self):
+        """调试：读取 surrounding text 并回填到当前输入框"""
+        try:
+            ibus_text, cursor_pos, anchor_pos = self.get_surrounding_text()
+            surrounding = ibus_text.get_text() if ibus_text else ""
+
+            text_len = len(surrounding)
+            cursor = max(0, min(int(cursor_pos), text_len))
+            anchor = max(0, min(int(anchor_pos), text_len))
+
+            selected = ""
+            if anchor != cursor:
+                sel_start, sel_end = sorted((anchor, cursor))
+                selected = surrounding[sel_start:sel_end]
+
+            current_sentence, previous_sentence = self._extract_sentence_window(surrounding, cursor)
+            has_surrounding_cap = bool(
+                self._client_capabilities & int(IBus.Capabilite.SURROUNDING_TEXT)
+            )
+
+            probe_text = (
+                "[VT-SURR "
+                f"cap={int(has_surrounding_cap)} len={text_len} cursor={cursor} anchor={anchor} "
+                f"prev='{self._clip_probe_text(previous_sentence)}' "
+                f"cur='{self._clip_probe_text(current_sentence)}' "
+                f"sel='{self._clip_probe_text(selected)}' "
+                f"all='{self._clip_probe_text(surrounding, 72)}']"
+            )
+            logger.info("SURROUNDING_PROBE %s", probe_text)
+            self._commit_text(probe_text)
+        except Exception as exc:
+            logger.warning("SURROUNDING_PROBE failed: %s", exc)
+            self._commit_text(f"[VT-SURR error='{self._clip_probe_text(str(exc), 64)}']")
+
     def _clear_preedit(self):
         """清除预编辑文本"""
         self.update_preedit_text(IBus.Text.new_from_string(""), 0, False)
+        self._clear_auxiliary_text()
         return False  # 用于GLib.timeout_add
 
-    def _commit_text(self, text: str):
+    def _commit_text(self, text: str, mutation_source: str = "app_commit"):
         """提交文本到应用"""
         self._clear_preedit()
         self.commit_text(IBus.Text.new_from_string(text))
+        if mutation_source == "voice_edit":
+            self._last_text_change_source = "voice_edit"
+        else:
+            self._last_text_change_source = "app_commit"
+            self._last_internal_edit_text = None
         logger.info(f"已提交文本: {text}")
         return False
 

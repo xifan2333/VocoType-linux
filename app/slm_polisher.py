@@ -46,6 +46,23 @@ DEFAULT_SYSTEM_PROMPT = """你是中文语音转写文本的后处理器。
 
 输出要求：只输出最终文本，不要任何说明。"""
 
+DEFAULT_EDIT_SYSTEM_PROMPT = """你是中文输入框的语音编辑器。
+
+你会收到：
+1) 用户的语音编辑指令
+2) 输入框当前全文
+3) 光标与选区信息
+
+你的任务：
+- 严格根据用户指令编辑“输入框当前全文”
+- 能少改就少改，不要无关改写
+- 保留原有语种、标点风格、技术字符串（路径/命令/代码/版本号）除非用户明确要求修改
+- 若指令与文本无关或无法执行，返回原文
+
+输出要求：
+- 只输出“编辑后的完整输入框文本”
+- 不要解释、不要加前后缀、不要输出 JSON。"""
+
 
 @dataclass
 class PolisherMetrics:
@@ -76,7 +93,14 @@ class SLMPolisher:
     _global_request_lock = threading.Lock()
     PROVIDER_REMOTE = "remote"
     PROVIDER_LOCAL_EPHEMERAL = "local_ephemeral"
-    _NON_FAILURE_REASONS = {"ok", "disabled", "not_long_mode", "too_short"}
+    _NON_FAILURE_REASONS = {
+        "ok",
+        "disabled",
+        "edit_disabled",
+        "not_long_mode",
+        "too_short",
+        "empty_instruction",
+    }
     _THINKING_PREFIX_RE = re.compile(
         r"^\s*(?:thinking\s*process|thought\s*process|reasoning|analysis|chain\s*of\s*thought|思考过程|推理过程|分析过程)\s*[:：]",
         flags=re.IGNORECASE,
@@ -128,6 +152,14 @@ class SLMPolisher:
             self.enable_thinking = bool(enable_thinking_cfg)
         self.api_key = str(cfg.get("api_key", "")).strip()
         self.system_prompt = str(cfg.get("system_prompt", DEFAULT_SYSTEM_PROMPT))
+        self.edit_enabled = bool(cfg.get("edit_enabled", True))
+        self.edit_system_prompt = str(
+            cfg.get("edit_system_prompt", DEFAULT_EDIT_SYSTEM_PROMPT)
+        )
+        self.edit_max_tokens = max(
+            self.max_tokens,
+            int(cfg.get("edit_max_tokens", max(256, self.max_tokens))),
+        )
         self.retry_without_proxy = bool(cfg.get("retry_without_proxy", True))
 
         # Local ephemeral worker options.
@@ -201,6 +233,53 @@ class SLMPolisher:
                 return self._polish_local(original, stripped, start)
             return self._polish_remote(original, stripped, start)
 
+    def edit_with_instruction(
+        self,
+        *,
+        context_text: str,
+        instruction: str,
+        cursor_pos: int,
+        anchor_pos: int,
+        selected_text: str = "",
+    ) -> Tuple[str, PolisherMetrics]:
+        """Edit full context text according to a voice instruction."""
+
+        start = time.perf_counter()
+        original = context_text or ""
+
+        if not self.enabled:
+            return original, PolisherMetrics(False, False, 0.0, "disabled")
+        if not self.edit_enabled:
+            return original, PolisherMetrics(False, False, 0.0, "edit_disabled")
+
+        normalized_instruction = (instruction or "").strip()
+        if not normalized_instruction:
+            return original, PolisherMetrics(False, False, 0.0, "empty_instruction")
+
+        request_text = self._build_edit_request_text(
+            context_text=original,
+            instruction=normalized_instruction,
+            cursor_pos=cursor_pos,
+            anchor_pos=anchor_pos,
+            selected_text=selected_text,
+        )
+
+        with self._global_request_lock:
+            old_system_prompt = self.system_prompt
+            old_max_tokens = self.max_tokens
+            old_enable_thinking = self.enable_thinking
+            try:
+                self.system_prompt = self.edit_system_prompt
+                self.max_tokens = self.edit_max_tokens
+                self.enable_thinking = False
+                if self.provider == self.PROVIDER_LOCAL_EPHEMERAL:
+                    return self._polish_local(original, request_text, start)
+                return self._polish_remote(original, request_text, start)
+            finally:
+                self.system_prompt = old_system_prompt
+                self.max_tokens = old_max_tokens
+                self.enable_thinking = old_enable_thinking
+
     @classmethod
     def is_failure_reason(cls, reason: str) -> bool:
         """Return whether the reason indicates a real SLM failure."""
@@ -215,6 +294,8 @@ class SLMPolisher:
         normalized = str(reason or "").strip()
         if not normalized:
             return "SLM 调用失败"
+        if normalized == "edit_disabled":
+            return "SLM 编辑未启用"
         if normalized == "timeout":
             return "SLM 调用失败：请求超时"
         if normalized == "request_error":
@@ -240,6 +321,26 @@ class SLMPolisher:
         if normalized == "exception":
             return "SLM 调用失败：运行异常"
         return f"SLM 调用失败：{normalized}"
+
+    @staticmethod
+    def _build_edit_request_text(
+        *,
+        context_text: str,
+        instruction: str,
+        cursor_pos: int,
+        anchor_pos: int,
+        selected_text: str,
+    ) -> str:
+        selected = (selected_text or "").strip() or "(无选中文本)"
+        return (
+            f"用户指令：{instruction}\n"
+            f"光标位置：{int(cursor_pos)}\n"
+            f"锚点位置：{int(anchor_pos)}\n"
+            f"选中文本：{selected}\n"
+            "输入框全文：\n"
+            f"{context_text}\n"
+            "请直接输出编辑后的完整输入框文本。"
+        )
 
     def _polish_remote(
         self,
