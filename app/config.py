@@ -54,6 +54,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "top_p": 0.9,
         "top_k": 20,
         "enable_thinking": False,
+        "edit_enabled": True,
+        "edit_max_tokens": 256,
         "api_key": "",
     },
     "output": {

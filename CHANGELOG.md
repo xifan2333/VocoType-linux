@@ -5,6 +5,46 @@ All notable changes to VoCoType Linux IBus will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.1] - 2026-03-29
+
+### Added
+
+- **IBus 语音编辑模式（`Ctrl+F9`）**：
+  - 新增 surrounding 能力门控：`cap=0` 时直接提示并停止
+  - 新增 SLM 指令编辑链路：基于输入框全文 + 光标/选区执行改写
+  - 新增确定性编辑命令（替换/删除/插入/格式化/剪贴板/撤销重做）
+  - 新增“输入类生成指令”：如“输入一段…/写一段…/生成一段…”
+  - 新增导航命令下发（行首/行尾/词级移动/全选/选词）
+  - 新增上下文诊断命令：`显示上下文信息` 输出 `[VT-SURR ...]`
+- **IBus surrounding 探针快捷键**：
+  - 新增 `Ctrl+Shift+F9` 探针回填
+  - 新增脚本 `scripts/test-surrounding-probe.sh` 用于多场景兼容性测试
+
+### Changed
+
+- **编辑状态展示优化**：
+  - 录音阶段提示从 preedit 改为 auxiliary，避免覆盖选中文本
+  - 增加环境状态提示（`sur/del/active/sel`）
+- **撤销/重做策略升级**：
+  - 从“仅内部编辑历史”改为智能分流：
+    - 最近一次为语音编辑且状态匹配：内部撤销栈
+    - 其他情况：下发应用级 `Ctrl+Z / Ctrl+Shift+Z`
+
+### Fixed
+
+- **修复选中文本编辑不可用**：避免编辑状态文本临时替换选中内容导致快照失配
+- **修复替换重复上屏**：替换前后确认 `delete_surrounding_text` 结果，失败时拒绝提交
+- **修复上下文输出后无法撤销**：`commit_only` 路径补充历史入栈
+- **增强激活态校验**：录音/编辑/导航前检查引擎激活状态，失活时取消操作
+
+### Documentation
+
+- 更新根文档与 IBus 文档：
+  - 新增 `Ctrl+F9` / `Ctrl+Shift+F9` 使用说明
+  - 新增常见编辑/导航/生成类语音指令示例
+  - 补充 `slm.edit_enabled`、`slm.edit_max_tokens` 配置说明
+  - 补充 surrounding 探针脚本用法
+
 ## [2.2.0] - 2026-03-28 (pre-release)
 
 ### Added

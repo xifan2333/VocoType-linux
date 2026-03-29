@@ -13,6 +13,7 @@
 - **100% 离线，隐私无忧** - 所有语音识别在本地完成，不上传任何数据
 - **旗舰级识别引擎** - 基于 FunASR Paraformer 模型，中英混合输入精准
 - **PTT 按键说话** - 按住 F9 说话，松开自动识别并输入；`Shift+F9` 支持长句润色模式
+- **语音编辑（IBus）** - `Ctrl+F9` 进入编辑指令模式，可改写/替换/插入/删除/导航/撤销重做
 - **轻量化设计** - 仅需 700MB 内存，纯 CPU 推理，无需显卡
 - **0.1 秒级响应** - 感受所言即所得的畅快体验
 - **可选 Rime 集成** - 需要拼音时可启用 Rime，无需切换输入法
@@ -90,6 +91,8 @@ fcitx5 -r
     "keepalive_ms": 60000,
     "min_chars": 8,
     "max_tokens": 96,
+    "edit_enabled": true,
+    "edit_max_tokens": 256,
     "enable_thinking": false
   }
 }
@@ -108,6 +111,8 @@ fcitx5 -r
     "timeout_ms": 20000,
     "min_chars": 8,
     "max_tokens": 128,
+    "edit_enabled": true,
+    "edit_max_tokens": 256,
     "retry_without_proxy": true
   }
 }
@@ -117,8 +122,37 @@ fcitx5 -r
 - `provider`：`local_ephemeral` / `remote`
 - `min_chars`：长句触发阈值（默认 `8`）
 - `max_tokens`：润色输出预算
+- `edit_enabled`：是否启用 `Ctrl+F9` 语音编辑（默认 `true`，仅 IBus）
+- `edit_max_tokens`：语音编辑模式下的输出预算（默认 `256`）
 - `enable_thinking`：是否允许思考输出（默认关闭）
 - `retry_without_proxy`：远程请求失败时尝试绕过代理直连重试
+
+---
+
+## IBus 语音编辑（Ctrl+F9）
+
+> 说明：该功能目前由 IBus 引擎提供，Fcitx5 暂未接入同等编辑链路。
+
+### 快捷键
+
+- `Ctrl+F9`：语音编辑模式（先读取 surrounding text，再录音识别编辑指令）
+- `Ctrl+Shift+F9`：surrounding 探针（回填 `[VT-SURR ...]` 调试信息）
+
+### 常用语音编辑能力
+
+- 文本修改：`把 A 改成 B`、`删除当前句`、`删除上一句`、`删除选中内容`
+- 插入生成：`输入一段对海底捞商家的好评`、`输入一段关于天气的描写`
+- 选择与导航：`全选`、`移动到开头`、`移动到结尾`、`左移三次`、`下一个词`
+- 历史操作：`撤销/撤销修改`、`重做`
+- 诊断命令：`显示上下文信息`（输出当前 `cap/del/cursor/anchor/prev/cur/sel/all`）
+
+### 行为说明
+
+- 若当前输入框不支持 surrounding 能力（`cap=0`），`Ctrl+F9` 会直接提示并停止。
+- 若录音期间输入框内容已变化，会提示 `输入框内容已变化，请重试`，避免误改错位文本。
+- 撤销策略采用“智能分流”：
+  - 最近一次是语音编辑且状态匹配：走内部撤销栈
+  - 否则：下发应用级撤销/重做（`Ctrl+Z` / `Ctrl+Shift+Z`）
 
 ---
 
