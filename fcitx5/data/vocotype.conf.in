@@ -4,4 +4,4 @@ Icon=microphone
 Label=🎤
 LangCode=zh_CN
 Addon=vocotype
-Configurable=False
+Configurable=True

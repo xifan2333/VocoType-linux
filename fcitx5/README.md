@@ -4,7 +4,7 @@ VoCoType 离线语音输入法的 Fcitx 5 版本实现。
 
 ## 功能特性
 
-- **语音输入** - 按住 F9 说话，松开自动识别并输入；`Shift+F9` 为长句模式（可选 SLM 润色）
+- **语音输入** - 默认按住 F9 说话，松开自动识别并输入；`Shift+F9` 为长句模式（支持配置热键）
 - **Rime 拼音** - 完整的 Rime 拼音输入支持
 - **完全离线** - 所有识别在本地完成，零网络依赖
 - **轻量高效** - 纯 CPU 推理，仅需 700MB 内存
@@ -58,7 +58,7 @@ bash fcitx5/scripts/install-fcitx5.sh
 1. 检查 Fcitx 5 和编译依赖
 2. 编译 C++ Addon
 3. 安装 Python 后端
-4. 配置 Python 虚拟环境（支持手动指定 conda 解释器）
+4. 配置 Python 环境（项目虚拟环境、用户级虚拟环境、系统 Python 或手动指定解释器）
 5. 配置音频设备（可选）
 6. 创建 systemd 服务
 
@@ -67,6 +67,26 @@ bash fcitx5/scripts/install-fcitx5.sh
 - 启用：写入 `~/.config/vocotype/fcitx5-backend.json` 的 `slm` 配置，并可选择：
   - 本地模型（`local_ephemeral`）：按下预热，润色后释放
   - 远程 API（`remote`）：配置 `model`、`endpoint`、`api_key`
+
+### 自定义快捷键
+
+优先使用 Fcitx5 配置面板调整：
+
+1. 打开 Fcitx5 配置
+2. 进入输入法列表里的 VoCoType
+3. 点击“配置”
+
+Fcitx5 会将这些设置持久化到 `~/.config/fcitx5/inputmethod/vocotype.conf`。
+
+- `ptt_key`：按住说话的主键，默认 `F9`
+- `ptt_hold_threshold_ms`：可选项，按住超过多少毫秒才开始录音，默认 `0`；小于等于 `0` 时不启用定时器，保持“按下立即录音”
+- `long_mode_modifier`：长句模式修饰键，默认 `Shift`，可选 `Shift` / `Ctrl` / `Alt` / `Super`
+- `提交时移除尾部句号`：默认关闭；开启后会在提交前移除文本末尾的 `。` 或 `.`
+- `Fn` 通常不会作为独立按键事件上报给 Linux/Fcitx5，因此一般不能直接配置成 `ptt_key`
+- 修改后需要重启 Fcitx5 或重新登录输入法会话
+
+如果你想区分“长按开始录音”和“短按不录音”，就把 `ptt_hold_threshold_ms` 调成大于 `0` 的值，例如 `180`。
+```
 
 ### 手动安装
 
@@ -86,7 +106,7 @@ make install
 mkdir -p ~/.local/share/fcitx5/addon
 mkdir -p ~/.local/share/fcitx5/inputmethod
 cp fcitx5/data/vocotype.conf ~/.local/share/fcitx5/addon/
-cp fcitx5/data/vocotype.conf.in ~/.local/share/fcitx5/inputmethod/
+cp fcitx5/data/vocotype.conf.in ~/.local/share/fcitx5/inputmethod/vocotype.conf
 ```
 
 #### 3. 安装 Python 后端
@@ -94,22 +114,24 @@ cp fcitx5/data/vocotype.conf.in ~/.local/share/fcitx5/inputmethod/
 ```bash
 INSTALL_DIR=$HOME/.local/share/vocotype-fcitx5
 mkdir -p "$INSTALL_DIR"
+mkdir -p "$INSTALL_DIR/scripts"
 cp -r app "$INSTALL_DIR/"
 cp -r fcitx5/backend "$INSTALL_DIR/"
 cp vocotype_version.py "$INSTALL_DIR/"
+cp scripts/setup-audio.py "$INSTALL_DIR/scripts/"
 
 # 创建虚拟环境
 python3 -m venv "$INSTALL_DIR/.venv"
 "$INSTALL_DIR/.venv/bin/pip" install -r requirements.txt
 
-# 安装完整版（含 pyrime）
-"$INSTALL_DIR/.venv/bin/pip" install -e ".[full]"
+# 安装 Rime 依赖
+"$INSTALL_DIR/.venv/bin/pip" install pyrime
 ```
 
 #### 4. 配置音频
 
 ```bash
-"$INSTALL_DIR/.venv/bin/python" scripts/setup-audio.py
+"$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/scripts/setup-audio.py"
 ```
 
 ## 使用方法
@@ -301,7 +323,7 @@ VoCoType Fcitx 5 版本使用**独立的 Rime 配置目录**：
 
 3. 重新配置音频设备：
    ```bash
-   ~/.local/share/vocotype-fcitx5/.venv/bin/python scripts/setup-audio.py
+   ~/.local/share/vocotype-fcitx5/.venv/bin/python   ~/.local/share/vocotype-fcitx5/scripts/setup-audio.py
    ```
 
 ### Rime 拼音不可用
@@ -314,10 +336,9 @@ VoCoType Fcitx 5 版本使用**独立的 Rime 配置目录**：
    ~/.local/share/vocotype-fcitx5/.venv/bin/python -c "import pyrime"
    ```
 
-2. 如果未安装，重新安装完整版：
+2. 如果未安装，补装 pyrime：
    ```bash
-   cd vocotype-cli
-   ~/.local/share/vocotype-fcitx5/.venv/bin/pip install -e ".[full]"
+  ~/.local/share/vocotype-fcitx5/.venv/bin/pip install pyrime
    ```
 
 3. 检查 Rime 数据目录：
@@ -348,7 +369,7 @@ systemctl --user disable vocotype-fcitx5-backend.service
 rm -rf ~/.local/share/vocotype-fcitx5
 rm ~/.local/lib/fcitx5/vocotype.so
 rm ~/.local/share/fcitx5/addon/vocotype.conf
-rm ~/.local/share/fcitx5/inputmethod/vocotype.conf.in
+rm ~/.local/share/fcitx5/inputmethod/vocotype.conf
 rm ~/.local/bin/vocotype-fcitx5-backend
 rm ~/.config/systemd/user/vocotype-fcitx5-backend.service
 

@@ -37,6 +37,7 @@ struct TranscribeResult {
     bool success = false;
     std::string text;
     std::string error;
+    std::string original_text;
 };
 
 /**

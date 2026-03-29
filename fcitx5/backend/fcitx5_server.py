@@ -266,6 +266,7 @@ class Fcitx5Backend:
                                             "error": self._slm_polisher.format_failure_message(
                                                 metrics.reason
                                             ),
+                                            "original_text": text,
                                         }
                                     else:
                                         result["text"] = polished_text

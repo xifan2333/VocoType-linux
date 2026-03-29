@@ -97,6 +97,7 @@ TranscribeResult IPCClient::transcribeAudio(const std::string& audio_path, bool 
         json response = json::parse(response_str);
 
         result.success = response.value("success", false);
+        result.original_text = response.value("original_text", "");
         if (result.success) {
             result.text = response.value("text", "");
         } else {
