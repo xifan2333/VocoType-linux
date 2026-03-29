@@ -20,13 +20,15 @@
 
 ## Demo
 https://github.com/user-attachments/assets/94772920-0f9e-4dff-8da5-c9026eb23256
-
+### 新功能! 语音编辑(v2.2.1)
+[Kooha-2026-03-29-08-50-00.webm](https://github.com/user-attachments/assets/4b936014-9477-4794-8d04-aa31d34577a0)
 
 
 ## 支持平台
 
 | 输入法框架 | 状态 | 说明 |
 |-----------|------|------|
+
 | **IBus** | ✅ 完整支持 | 适用于 GNOME、大多数发行版默认 |
 | **Fcitx 5** | ✅ 完整支持 | 适用于 KDE、偏好 Fcitx 的用户 |
 
