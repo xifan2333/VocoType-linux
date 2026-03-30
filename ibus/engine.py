@@ -605,7 +605,14 @@ class VoCoTypeEngine(IBus.Engine):
         """处理按键事件"""
         # 调试：记录所有按键
         is_release = bool(state & IBus.ModifierType.RELEASE_MASK)
-        logger.info(f"Key event: keyval={keyval}, keycode={keycode}, state={state}, is_release={is_release}, F9={self.PTT_KEYVAL}")
+        logger.debug(
+            "Key event: keyval=%s, keycode=%s, state=%s, is_release=%s, F9=%s",
+            keyval,
+            keycode,
+            state,
+            is_release,
+            self.PTT_KEYVAL,
+        )
 
         # 检查是否是松开事件
         is_release = bool(state & IBus.ModifierType.RELEASE_MASK)
