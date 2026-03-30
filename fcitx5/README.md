@@ -78,15 +78,14 @@ bash fcitx5/scripts/install-fcitx5.sh
 
 Fcitx5 会将这些设置持久化到 `~/.config/fcitx5/inputmethod/vocotype.conf`。
 
-- `ptt_key`：按住说话的主键，默认 `F9`
-- `ptt_hold_threshold_ms`：可选项，按住超过多少毫秒才开始录音，默认 `0`；小于等于 `0` 时不启用定时器，保持“按下立即录音”
-- `long_mode_modifier`：长句模式修饰键，默认 `Shift`，可选 `Shift` / `Ctrl` / `Alt` / `Super`
-- `提交时移除尾部句号`：默认关闭；开启后会在提交前移除文本末尾的 `。` 或 `.`
-- `Fn` 通常不会作为独立按键事件上报给 Linux/Fcitx5，因此一般不能直接配置成 `ptt_key`
+- `PTTKey`：按住说话的主键，默认 `F9`
+- `PTTHoldThresholdMs`：可选项，按住超过多少毫秒才开始录音，默认 `0`；小于等于 `0` 时不启用定时器，保持“按下立即录音”
+- `LongModeModifier`：长句模式修饰键，默认 `Shift`，可选 `Shift` / `Ctrl` / `Alt` / `Super`
+- `StripTrailingPeriodOnCommit`：默认关闭；开启后会在提交前移除文本末尾的 `。` 或 `.`
+- `Fn` 通常不会作为独立按键事件上报给 Linux/Fcitx5，因此一般不能直接配置成 `PTTKey`
 - 修改后需要重启 Fcitx5 或重新登录输入法会话
 
-如果你想区分“长按开始录音”和“短按不录音”，就把 `ptt_hold_threshold_ms` 调成大于 `0` 的值，例如 `180`。
-```
+如果你想区分“长按开始录音”和“短按不录音”，就把 `PTTHoldThresholdMs` 调成大于 `0` 的值，例如 `180`。
 
 ### 手动安装
 

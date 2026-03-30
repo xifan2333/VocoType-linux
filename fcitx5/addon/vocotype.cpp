@@ -18,6 +18,7 @@
 #include <fcitx-utils/utf8.h>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdlib>
 #include <cstdio>
 #include <cerrno>
@@ -33,7 +34,8 @@ namespace {
 constexpr auto FCITX_CONFIG_PATH = "inputmethod/vocotype.conf";
 constexpr uint64_t RECORDING_ANIMATION_INTERVAL_US = 200000;
 constexpr uint64_t PTT_RELEASE_DEBOUNCE_US = 50000;
-constexpr uint64_t DUPLICATE_COMMIT_SUPPRESS_US = 1000000;
+// Suppress only near-simultaneous duplicate commits from the same IC/client.
+constexpr uint64_t DUPLICATE_COMMIT_SUPPRESS_US = 250000;
 
 constexpr std::array<const char *, 8> RECORDING_ANIMATION_FRAMES = {
     "🟢 正在听 ●     ",
@@ -424,6 +426,10 @@ void VoCoTypeAddon::replayShortTapAsRegularKey(fcitx::InputContext* ic) {
         if (ptt_key_sym_ == FcitxKey_Return || ptt_key_sym_ == FcitxKey_KP_Enter) {
             text = "\n";
         } else {
+            const int time = 0;
+            // Non-character key: replay raw key event so short taps are not swallowed.
+            ic->forwardKey(fcitx::Key(ptt_key_sym_, states), false, time);
+            ic->forwardKey(fcitx::Key(ptt_key_sym_, states), true, time);
             return;
         }
     }
@@ -859,10 +865,39 @@ bool VoCoTypeAddon::pasteTextForClient(fcitx::InputContext* ic, const std::strin
     clearUI(ic);
 
     if (session_type == "x11") {
-        std::thread([program, text]() {
+        auto ic_ref =
+            ic ? ic->watch() : fcitx::TrackableObjectReference<fcitx::InputContext>();
+        std::thread([this, ic_ref, program, text]() {
             if (!pasteTextToX11Client(text)) {
                 FCITX_WARN() << "Failed to paste text through X11 clipboard bridge for program="
                              << program;
+                instance_->eventDispatcher().scheduleWithContext(
+                    ic_ref, [this, ic_ref, text]() {
+                        auto* ic_ptr = ic_ref.get();
+                        if (!ic_ptr) {
+                            return;
+                        }
+
+                        // Clipboard bridge failed: fallback to direct commit to avoid text loss.
+                        clearUI(ic_ptr);
+                        if (ic_ptr->capabilityFlags() &
+                            fcitx::CapabilityFlag::CommitStringWithCursor) {
+                            ic_ptr->commitStringWithCursor(text, fcitx::utf8::length(text));
+                        } else {
+                            ic_ptr->commitString(text);
+                        }
+
+                        const uint64_t now = fcitx::now(CLOCK_MONOTONIC);
+                        last_committed_ic_ = ic_ptr;
+                        last_committed_program_ = ic_ptr->program();
+                        last_committed_frontend_ = std::string(ic_ptr->frontendName());
+                        last_committed_text_ = text;
+                        last_commit_time_us_ = now;
+                        FCITX_INFO() << "Fallback committed text after X11 bridge failure: program="
+                                     << last_committed_program_
+                                     << ", frontend=" << last_committed_frontend_
+                                     << ", text=" << text;
+                    });
                 return;
             }
             FCITX_INFO() << "Pasted text through X11 clipboard bridge for program=" << program
@@ -891,7 +926,8 @@ void VoCoTypeAddon::commitText(fcitx::InputContext* ic, const std::string& text)
     const uint64_t now = fcitx::now(CLOCK_MONOTONIC);
     const std::string current_program = ic->program();
     const std::string current_frontend(ic->frontendName());
-    if (last_committed_text_ == commit_text &&
+    if (last_committed_ic_ == ic &&
+        last_committed_text_ == commit_text &&
         last_committed_program_ == current_program &&
         last_committed_frontend_ == current_frontend &&
         now >= last_commit_time_us_ &&

@@ -79,6 +79,13 @@ resolve_python_cmd() {
     command -v "$py" 2>/dev/null || return 1
 }
 
+escape_sed_replacement() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//&/\\&}
+    printf '%s' "$value"
+}
+
 get_python_version() {
     "$1" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null
 }
@@ -478,7 +485,8 @@ case "$PY_CHOICE" in
             exit 1
         fi
 
-        PYTHON="$PROJECT_DIR/.venv/bin/python"
+        # 选项 4：用手动指定解释器创建/驱动安装目录虚拟环境。
+        PYTHON="$INSTALL_DIR/.venv/bin/python"
         ;;
     1)
         PYTHON="$PROJECT_DIR/.venv/bin/python"
@@ -840,7 +848,8 @@ RECORDER_SCRIPT="$HOME/.local/share/vocotype-fcitx5/backend/audio_recorder.py"
 
 exec "$PYTHON" "$RECORDER_SCRIPT" "$@"
 EOF
-sed -i "s|VOCOTYPE_PYTHON|$PYTHON|g" "$HOME/.local/bin/vocotype-fcitx5-recorder"
+PYTHON_SED=$(escape_sed_replacement "$PYTHON")
+sed -i "s|VOCOTYPE_PYTHON|$PYTHON_SED|g" "$HOME/.local/bin/vocotype-fcitx5-recorder"
 chmod +x "$HOME/.local/bin/vocotype-fcitx5-recorder"
 
 cat > "$HOME/.local/bin/vocotype-fcitx5-backend" << 'EOF'
@@ -860,7 +869,7 @@ fi
 # 启动服务
 exec "$PYTHON" "$SERVER_SCRIPT" "$@"
 EOF
-sed -i "s|VOCOTYPE_PYTHON|$PYTHON|g" "$HOME/.local/bin/vocotype-fcitx5-backend"
+sed -i "s|VOCOTYPE_PYTHON|$PYTHON_SED|g" "$HOME/.local/bin/vocotype-fcitx5-backend"
 chmod +x "$HOME/.local/bin/vocotype-fcitx5-backend"
 
 # 创建 systemd 用户服务
