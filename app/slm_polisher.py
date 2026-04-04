@@ -473,18 +473,14 @@ class SLMPolisher:
         start: float,
     ) -> Tuple[str, PolisherMetrics]:
         try:
-            total_timeout_s = max(0.05, self.timeout_ms / 1000.0)
-            ready_timeout_s = min(
-                total_timeout_s,
-                max(0.05, self.ready_wait_ms / 1000.0),
-            )
+            ready_timeout_s = self._local_ready_timeout_s()
             ok, reason = self._ensure_local_worker_ready(timeout_s=ready_timeout_s)
             if not ok:
                 return self._fallback(original, start, reason)
 
-            timeout_s = self._remaining_timeout(start)
-            if timeout_s <= 0.0:
-                return self._fallback(original, start, "local_timeout")
+            # Warmup waiting and generation serve different phases; keep full
+            # generation budget instead of consuming it by readiness wait.
+            timeout_s = max(0.05, self.timeout_ms / 1000.0)
             request_payload = {
                 "type": "polish",
                 "text": stripped,
@@ -514,9 +510,7 @@ class SLMPolisher:
                 retry_payload["enable_thinking"] = False
                 retry_payload["max_tokens"] = self.max_tokens
                 retry_payload["temperature"] = 0.0
-                timeout_s = self._remaining_timeout(start)
-                if timeout_s <= 0.0:
-                    return self._fallback(original, start, "local_timeout")
+                timeout_s = max(0.05, self.timeout_ms / 1000.0)
                 response = self._local_worker_request(
                     retry_payload,
                     timeout_s=timeout_s,
@@ -548,6 +542,17 @@ class SLMPolisher:
         finally:
             # Release on idle; allow fast reuse within keepalive window.
             self.release()
+
+    def _local_ready_timeout_s(self) -> float:
+        """Return ready-wait timeout for local worker.
+
+        Prefer `ready_wait_ms` for responsiveness, but honor the larger warmup
+        window when caller allows long local timeout.
+        """
+        ready_wait_s = max(0.05, self.ready_wait_ms / 1000.0)
+        warmup_wait_s = max(0.05, self.warmup_timeout_ms / 1000.0)
+        request_timeout_s = max(0.05, self.timeout_ms / 1000.0)
+        return min(request_timeout_s, max(ready_wait_s, warmup_wait_s))
 
     def _remaining_timeout(self, start: float) -> float:
         remaining = (self.timeout_ms / 1000.0) - (time.perf_counter() - start)

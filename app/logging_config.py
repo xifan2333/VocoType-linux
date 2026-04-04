@@ -4,10 +4,16 @@ import logging
 import os
 import sys
 from datetime import datetime
-from logging.handlers import TimedRotatingFileHandler
+from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 
 
-def setup_logging(level: str = "INFO", log_dir: str = None) -> None:
+def setup_logging(
+    level: str = "INFO",
+    log_dir: str = None,
+    log_file: str = None,
+    max_bytes: int = 10 * 1024 * 1024,
+    backup_count: int = 3,
+) -> None:
     """配置全局日志系统（应该在程序入口最早调用）
     
     Args:
@@ -15,6 +21,9 @@ def setup_logging(level: str = "INFO", log_dir: str = None) -> None:
         log_dir: 日志目录，如果提供则同时输出到文件
                 文件命名格式：log_YYYY-MM-DD.log
                 自动轮转：每天午夜，最多保留3个备份，单文件最大10MB
+        log_file: 固定日志文件路径，如果提供则优先使用该文件并按大小轮转
+        max_bytes: 文件日志单文件最大大小（字节）
+        backup_count: 文件日志最多保留的历史文件数量
     
     特性：
         - 控制台输出到stderr（避免干扰stdout通信）
@@ -42,7 +51,31 @@ def setup_logging(level: str = "INFO", log_dir: str = None) -> None:
     root_logger.addHandler(console_handler)
     
     # 可选的文件输出
-    if log_dir:
+    if log_file:
+        try:
+            expanded_log_file = os.path.expanduser(log_file)
+            log_parent = os.path.dirname(expanded_log_file) or "."
+            os.makedirs(log_parent, exist_ok=True)
+
+            file_handler = RotatingFileHandler(
+                expanded_log_file,
+                maxBytes=max_bytes,
+                backupCount=backup_count,
+                encoding="utf-8",
+            )
+            file_handler.setFormatter(formatter)
+            root_logger.addHandler(file_handler)
+
+            logging.info(
+                "日志系统已初始化 - 级别=%s, 文件=%s, 轮转=%dMB x %d",
+                level,
+                expanded_log_file,
+                max_bytes // (1024 * 1024),
+                backup_count,
+            )
+        except Exception as e:
+            logging.warning(f"文件日志配置失败，仅使用控制台日志: {e}")
+    elif log_dir:
         try:
             os.makedirs(log_dir, exist_ok=True)
             
@@ -60,14 +93,14 @@ def setup_logging(level: str = "INFO", log_dir: str = None) -> None:
                 log_file,
                 when='midnight',
                 interval=1,
-                backupCount=3,
+                backupCount=backup_count,
                 encoding='utf-8'
             )
             
             # 添加文件大小限制（10MB）
             # 注意：TimedRotatingFileHandler没有原生的maxBytes，
             # 但我们可以设置属性供监控使用
-            file_handler.maxBytes = 10 * 1024 * 1024
+            file_handler.maxBytes = max_bytes
             
             file_handler.setFormatter(formatter)
             root_logger.addHandler(file_handler)
@@ -78,4 +111,3 @@ def setup_logging(level: str = "INFO", log_dir: str = None) -> None:
             logging.warning(f"文件日志配置失败，仅使用控制台日志: {e}")
     else:
         logging.info(f"日志系统已初始化 - 级别={level}, 仅控制台输出")
-

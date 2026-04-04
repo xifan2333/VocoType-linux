@@ -14,6 +14,8 @@ import threading
 import queue
 import tempfile
 import os
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -114,6 +116,16 @@ class VoCoTypeEngine(IBus.Engine):
         IBus.KEY_a: 30,
         IBus.KEY_z: 44,
     }
+    _CAPABILITY_FLAGS = (
+        (int(IBus.Capabilite.PREEDIT_TEXT), "preedit"),
+        (int(IBus.Capabilite.AUXILIARY_TEXT), "aux"),
+        (int(IBus.Capabilite.LOOKUP_TABLE), "lookup"),
+        (int(IBus.Capabilite.FOCUS), "focus"),
+        (int(IBus.Capabilite.PROPERTY), "property"),
+        (int(IBus.Capabilite.SURROUNDING_TEXT), "surrounding"),
+        (int(IBus.Capabilite.OSK), "osk"),
+        (int(IBus.Capabilite.SYNC_PROCESS_KEY), "sync_key"),
+    )
 
     # 全局session跟踪（用于调试）
     _active_sessions = set()
@@ -130,6 +142,7 @@ class VoCoTypeEngine(IBus.Engine):
         # 需要显式传入 DBus 连接与 object_path，避免 GLib g_variant object_path 断言失败。
         super().__init__(connection=bus.get_connection(), object_path=object_path)
         self._bus = bus
+        self._object_path = object_path
 
         # 状态
         self._is_recording = False
@@ -165,11 +178,19 @@ class VoCoTypeEngine(IBus.Engine):
         self._rime_enabled = self._rime_available  # 只有 pyrime 可用时才启用
         self._rime_init_lock = threading.Lock()
         self._client_capabilities = 0
+        self._window_context_cache = "window=unavailable(reason=not-collected)"
+        self._window_context_cache_ts = 0.0
 
         if self._rime_available:
-            logger.info("VoCoTypeEngine 实例已创建（Rime 集成已启用）")
+            logger.info(
+                "VoCoTypeEngine 实例已创建（Rime 集成已启用, path=%s）",
+                self._object_path,
+            )
         else:
-            logger.info("VoCoTypeEngine 实例已创建（纯语音模式，Rime 集成未启用）")
+            logger.info(
+                "VoCoTypeEngine 实例已创建（纯语音模式，Rime 集成未启用, path=%s）",
+                self._object_path,
+            )
 
     def _check_rime_available(self) -> bool:
         """检查 pyrime 是否可用"""
@@ -179,6 +200,157 @@ class VoCoTypeEngine(IBus.Engine):
         except ImportError:
             logger.info("pyrime 未安装，Rime 集成功能将被禁用")
             return False
+
+    def _format_capabilities(self, caps: Optional[int] = None) -> str:
+        value = int(self._client_capabilities if caps is None else caps)
+        names = [
+            name for flag, name in self._CAPABILITY_FLAGS
+            if value & flag
+        ]
+        return "|".join(names) if names else "-"
+
+    @staticmethod
+    def _run_debug_command(argv: list[str], timeout: float = 0.2) -> str:
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except Exception:
+            return ""
+        if result.returncode != 0:
+            return ""
+        return result.stdout.strip()
+
+    def _get_active_window_context(self) -> str:
+        now = time.monotonic()
+        if (
+            self._window_context_cache
+            and (now - self._window_context_cache_ts) < 0.5
+        ):
+            return self._window_context_cache
+
+        session_type = os.environ.get("XDG_SESSION_TYPE", "") or "unknown"
+        xprop = shutil.which("xprop")
+        if not xprop:
+            summary = f"window=unavailable(session={session_type}, reason=xprop-missing)"
+            self._window_context_cache = summary
+            self._window_context_cache_ts = now
+            return summary
+
+        active_window = self._run_debug_command([xprop, "-root", "_NET_ACTIVE_WINDOW"])
+        match = re.search(r"window id # (0x[0-9a-fA-F]+)", active_window)
+        if not match:
+            summary = f"window=unavailable(session={session_type}, reason=no-active-window)"
+            self._window_context_cache = summary
+            self._window_context_cache_ts = now
+            return summary
+
+        window_id = match.group(1)
+        if window_id == "0x0":
+            summary = f"window=unavailable(session={session_type}, reason=window-id-0)"
+            self._window_context_cache = summary
+            self._window_context_cache_ts = now
+            return summary
+
+        details = self._run_debug_command(
+            [xprop, "-id", window_id, "WM_CLASS", "_NET_WM_NAME", "WM_NAME", "_NET_WM_PID"]
+        )
+
+        wm_class = ""
+        title = ""
+        pid = ""
+        for line in details.splitlines():
+            if line.startswith("WM_CLASS"):
+                quoted = re.findall(r'"([^"]*)"', line)
+                wm_class = "/".join(filter(None, quoted))
+            elif line.startswith("_NET_WM_NAME") or line.startswith("WM_NAME"):
+                quoted = re.findall(r'"([^"]*)"', line)
+                if quoted:
+                    title = quoted[0]
+                elif "=" in line:
+                    title = line.split("=", 1)[1].strip()
+            elif line.startswith("_NET_WM_PID") and "=" in line:
+                pid = line.split("=", 1)[1].strip()
+
+        cmd = ""
+        ps_cmd = shutil.which("ps")
+        if pid and ps_cmd:
+            cmd_output = self._run_debug_command(
+                [ps_cmd, "-p", pid, "-o", "comm=", "-o", "args="],
+                timeout=0.2,
+            )
+            if cmd_output:
+                cmd = self._clip_probe_text(cmd_output, 96)
+
+        summary_parts = [f"id={window_id}"]
+        if wm_class:
+            summary_parts.append(f"class='{self._clip_probe_text(wm_class, 48)}'")
+        if title:
+            summary_parts.append(f"title='{self._clip_probe_text(title, 64)}'")
+        if pid:
+            summary_parts.append(f"pid={pid}")
+        if cmd:
+            summary_parts.append(f"cmd='{cmd}'")
+
+        summary = "window=" + " ".join(summary_parts)
+        self._window_context_cache = summary
+        self._window_context_cache_ts = now
+        return summary
+
+    def _get_surrounding_debug_context(self) -> str:
+        if not self._supports_surrounding_text():
+            return "sur=unsupported"
+
+        snapshot, error = self._capture_surrounding_snapshot()
+        if snapshot is None:
+            reason = self._clip_probe_text(error, 64) or "unknown"
+            return f"sur=unavailable reason='{reason}'"
+
+        current_sentence, previous_sentence = self._extract_sentence_window(
+            snapshot.text,
+            snapshot.cursor_pos,
+        )
+        return (
+            "sur="
+            f"len={len(snapshot.text)} cursor={snapshot.cursor_pos} anchor={snapshot.anchor_pos} "
+            f"sel={len(snapshot.selected_text)} "
+            f"prev='{self._clip_probe_text(previous_sentence)}' "
+            f"cur='{self._clip_probe_text(current_sentence)}' "
+            f"selected='{self._clip_probe_text(snapshot.selected_text)}'"
+        )
+
+    def _build_lifecycle_context(self, include_surrounding: bool = False) -> str:
+        parts = [
+            f"path={self._object_path}",
+            f"enabled={int(self._engine_enabled)}",
+            f"focus={int(self._has_focus)}",
+            f"active={int(self._is_engine_active())}",
+            f"recording={int(self._is_recording)}",
+            f"long={int(self._recording_long_mode)}",
+            f"edit={int(self._recording_edit_mode)}",
+            f"caps=0x{self._client_capabilities:x}[{self._format_capabilities()}]",
+            (
+                "rime="
+                f"available:{int(self._rime_available)} "
+                f"enabled:{int(self._rime_enabled)} "
+                f"session:{int(self._rime_session is not None)}"
+            ),
+            self._get_active_window_context(),
+        ]
+        if include_surrounding:
+            parts.append(self._get_surrounding_debug_context())
+        return "; ".join(parts)
+
+    def _log_lifecycle(self, event: str, include_surrounding: bool = False) -> None:
+        logger.info(
+            "Lifecycle[%s]: %s",
+            event,
+            self._build_lifecycle_context(include_surrounding=include_surrounding),
+        )
 
     def _resolve_input_device(self, sd):
         """选择可用的输入设备，优先使用显式配置。"""
@@ -430,7 +602,6 @@ class VoCoTypeEngine(IBus.Engine):
 
     def do_enable(self):
         """引擎启用"""
-        logger.info("Engine enabled")
         self._engine_enabled = True
         # 告知客户端需要 surrounding text（若客户端支持）。
         # IBus C API 文档建议在 enable 阶段调用 get_surrounding_text。
@@ -438,15 +609,24 @@ class VoCoTypeEngine(IBus.Engine):
             self.get_surrounding_text()
         except Exception as exc:
             logger.debug("enable 阶段请求 surrounding text 失败: %s", exc)
+        self._log_lifecycle("enable", include_surrounding=self._supports_surrounding_text())
 
     def do_set_capabilities(self, caps):
         """记录客户端能力（用于 surrounding text 调试输出）"""
+        previous = self._client_capabilities
         self._client_capabilities = int(caps)
-        logger.info("Client capabilities updated: 0x%x", self._client_capabilities)
+        logger.info(
+            "Lifecycle[capabilities]: old=0x%x[%s] new=0x%x[%s]; %s",
+            previous,
+            self._format_capabilities(previous),
+            self._client_capabilities,
+            self._format_capabilities(),
+            self._build_lifecycle_context(include_surrounding=False),
+        )
 
     def do_disable(self):
         """引擎禁用时清理资源（IBus不会调用do_destroy）"""
-        logger.info("Engine disabled")
+        self._log_lifecycle("disable", include_surrounding=self._supports_surrounding_text())
         self._engine_enabled = False
 
         # 停止录音
@@ -478,7 +658,7 @@ class VoCoTypeEngine(IBus.Engine):
 
     def do_destroy(self):
         """引擎销毁时清理资源"""
-        logger.info("Engine destroying, cleaning up resources")
+        self._log_lifecycle("destroy", include_surrounding=False)
 
         # 停止录音
         if self._is_recording:
@@ -509,13 +689,13 @@ class VoCoTypeEngine(IBus.Engine):
 
     def do_focus_in(self):
         """获得输入焦点"""
-        logger.info("Engine got focus")
         self._has_focus = True
+        self._log_lifecycle("focus-in", include_surrounding=False)
 
     def do_focus_out(self):
         """失去输入焦点"""
-        logger.info("Engine lost focus")
         self._has_focus = False
+        self._log_lifecycle("focus-out", include_surrounding=False)
         if self._is_recording:
             self._stop_recording()
         # 清除 Rime 组合

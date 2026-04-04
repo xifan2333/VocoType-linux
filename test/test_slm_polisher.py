@@ -55,6 +55,32 @@ def test_local_provider_default_keepalive_enabled():
     assert polisher.keepalive_ms == 60000
 
 
+def test_local_ready_timeout_uses_request_timeout_ceiling():
+    polisher = SLMPolisher(
+        {
+            "enabled": True,
+            "provider": "local_ephemeral",
+            "timeout_ms": 12000,
+            "ready_wait_ms": 2000,
+            "warmup_timeout_ms": 90000,
+        }
+    )
+    assert polisher._local_ready_timeout_s() == 12.0
+
+
+def test_local_ready_timeout_respects_short_request_timeout():
+    polisher = SLMPolisher(
+        {
+            "enabled": True,
+            "provider": "local_ephemeral",
+            "timeout_ms": 1500,
+            "ready_wait_ms": 2000,
+            "warmup_timeout_ms": 90000,
+        }
+    )
+    assert polisher._local_ready_timeout_s() == 1.5
+
+
 def test_release_with_keepalive_delays_shutdown(monkeypatch):
     class _FakeProc:
         def poll(self):

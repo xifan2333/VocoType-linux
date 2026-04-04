@@ -90,11 +90,16 @@ import gi
 gi.require_version('IBus', '1.0')
 from gi.repository import IBus, GLib
 
+from app.logging_config import setup_logging
 from ibus.factory import VoCoTypeFactory
 from ibus.engine import VoCoTypeEngine
 from vocotype_version import __version__
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_IBUS_LOG_FILE = Path.home() / ".local" / "share" / "vocotype" / "ibus.log"
+IBUS_LOG_MAX_BYTES = 20 * 1024 * 1024
+IBUS_LOG_BACKUP_COUNT = 5
 
 
 class VoCoTypeIMApp:
@@ -202,22 +207,32 @@ def main():
         print_xml()
         return
 
-    # 配置日志
-    log_level = logging.DEBUG if args.debug else logging.INFO
-    logging.basicConfig(
+    log_level = "DEBUG" if args.debug else "INFO"
+    log_path = Path(
+        os.environ.get("VOCOTYPE_LOG_FILE", str(DEFAULT_IBUS_LOG_FILE))
+    ).expanduser()
+    setup_logging(
         level=log_level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(sys.stderr),
-        ]
+        log_file=str(log_path),
+        max_bytes=IBUS_LOG_MAX_BYTES,
+        backup_count=IBUS_LOG_BACKUP_COUNT,
     )
-    log_path = os.environ.get("VOCOTYPE_LOG_FILE")
-    if log_path:
-        file_handler = logging.FileHandler(log_path)
-        file_handler.setFormatter(logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        ))
-        logging.getLogger().addHandler(file_handler)
+    logger.info(
+        "IBus logging configured: file=%s rotate=%dMB backups=%d",
+        log_path,
+        IBUS_LOG_MAX_BYTES // (1024 * 1024),
+        IBUS_LOG_BACKUP_COUNT,
+    )
+    logger.info(
+        "IBus process startup: pid=%s ppid=%s cwd=%s argv=%s session_type=%s display=%s wayland=%s",
+        os.getpid(),
+        os.getppid(),
+        os.getcwd(),
+        sys.argv,
+        os.environ.get("XDG_SESSION_TYPE", ""),
+        os.environ.get("DISPLAY", ""),
+        os.environ.get("WAYLAND_DISPLAY", ""),
+    )
 
     # 创建并运行应用
     app = VoCoTypeIMApp(exec_by_ibus=args.ibus)

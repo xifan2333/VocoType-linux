@@ -339,6 +339,18 @@ bool VoCoTypeAddon::forwardKeyToRime(fcitx::InputContext* ic, fcitx::KeySym keyv
         return false;
     }
 
+    // Let system/global shortcuts pass through in Chinese mode as well.
+    // Otherwise combinations like Super+V / Hyper+E may be swallowed by IME.
+    const bool has_system_shortcut_modifier =
+        (states & fcitx::KeyState::Super) ||
+        (states & fcitx::KeyState::Super2) ||
+        (states & fcitx::KeyState::Hyper) ||
+        (states & fcitx::KeyState::Hyper2) ||
+        (states & fcitx::KeyState::Meta);
+    if (has_system_shortcut_modifier) {
+        return false;
+    }
+
     int mask = 0;
     if (states & fcitx::KeyState::Shift) {
         mask |= (1 << 0);  // kShiftMask
