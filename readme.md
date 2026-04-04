@@ -28,7 +28,6 @@ https://github.com/user-attachments/assets/94772920-0f9e-4dff-8da5-c9026eb23256
 
 | 输入法框架 | 状态 | 说明 |
 |-----------|------|------|
-
 | **IBus** | ✅ 完整支持 | 适用于 GNOME、大多数发行版默认 |
 | **Fcitx 5** | ✅ 完整支持 | 适用于 KDE、偏好 Fcitx 的用户 |
 
