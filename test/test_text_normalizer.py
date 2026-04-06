@@ -41,3 +41,17 @@ def test_preserve_approximate_phrases():
 
 def test_preserve_non_numeric_phrase_with_dian():
     assert text_normalizer.normalize_chinese_numbers("我一点也不困") == "我一点也不困"
+
+
+def test_preserve_yixia_phrase():
+    assert (
+        text_normalizer.normalize_chinese_numbers("阅读这个文档，了解一下项目")
+        == "阅读这个文档，了解一下项目"
+    )
+
+
+def test_preserve_approximate_xiasi_phrase():
+    assert (
+        text_normalizer.normalize_chinese_numbers("一不小心蹭了三四下车")
+        == "一不小心蹭了三四下车"
+    )

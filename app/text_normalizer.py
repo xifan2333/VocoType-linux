@@ -91,7 +91,7 @@ _MEASURE_TOKENS = (
 )
 _SINGLE_DIGIT_TOKENS = tuple(token for token in _MEASURE_TOKENS if token != "个")
 _CONTEXT_PREFIX_CHARS = set("到至和或比乘除加减约近超共用隔差")
-_CONTEXT_SUFFIX_CHARS = set("到至和或比乘除加减多余前后上下")
+_CONTEXT_SUFFIX_CHARS = set("到至和或比乘除加减多余前后")
 
 
 def normalize_text(text: str, *, convert_chinese_numbers: bool = True) -> str:

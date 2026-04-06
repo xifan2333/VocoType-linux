@@ -5,6 +5,21 @@ All notable changes to VoCoType Linux IBus will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.3] - 2026-04-06
+
+### Changed
+
+- **普通 F9 数字输入更顺畅**：
+  - 在常规语音输入链路中新增中文数字到阿拉伯数字的后处理
+  - 支持日期、序号、百分比、小数与常见口语简写数字表达
+  - 例如：`二零二六年四月五号` -> `2026年4月5号`，`第三十二章` -> `第32章`
+
+### Fixed
+
+- **减少数字误判**：
+  - 避免把 `了解一下` 误转成 `了解1下`
+  - 避免把 `三四下车`、`三四下` 这类近似表达误拼成连续数字
+
 ## [2.2.1] - 2026-03-29
 
 ### Added
