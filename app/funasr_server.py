@@ -28,6 +28,7 @@ os.environ.setdefault("FUNASR_DEVICE", "cpu")
 from app.funasr_config import MODEL_REVISION, MODELS
 from app.download_models import get_model_cache_path
 from app.logging_config import setup_logging
+from app.text_normalizer import normalize_text
 
 
 logger = logging.getLogger(__name__)
@@ -414,6 +415,7 @@ class FunASRServer:
                 # 默认启用 VAD / PUNC，可在外部通过选项或环境变量关闭
                 "use_vad": os.environ.get("FUNASR_USE_VAD", "false").lower() not in ("0", "false", "no"),
                 "use_punc": os.environ.get("FUNASR_USE_PUNC", "true").lower() not in ("0", "false", "no"),
+                "normalize_chinese_numbers": True,
                 "language": "zh",
             }
 
@@ -539,6 +541,12 @@ class FunASRServer:
                     logger.info("标点恢复完成")
                 except Exception as e:
                     logger.warning(f"标点恢复失败，使用原始文本: {str(e)}")
+
+            if default_options["normalize_chinese_numbers"] and final_text.strip():
+                final_text = normalize_text(
+                    final_text,
+                    convert_chinese_numbers=True,
+                )
 
             self.transcription_count += 1
 
